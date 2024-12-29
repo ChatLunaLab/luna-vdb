@@ -53,14 +53,8 @@ impl LunaVDB {
         }
     }
 
-    pub fn remove(&mut self, ids: Vec<String>) -> bool {
-        let mut success = true;
-        for id in ids {
-            if engine::remove(&mut self.index, &id).is_err() {
-                success = false;
-            }
-        }
-        success
+    pub fn remove(&mut self, ids: Vec<String>) {
+        engine::remove(&mut self.index, &ids).unwrap();
     }
 
     pub fn clear(&mut self) {

@@ -6,29 +6,23 @@ use kiddo::float::{distance::SquaredEuclidean, kdtree::KdTree};
 use std::{collections::HashMap, convert::TryInto};
 
 pub fn index<'a>(data: &'a Vec<Embedding>, ids: &'a Vec<String>) -> Index {
-    let data_vec: Vec<([f32; 1024], u64, String)> = data
-        .iter()
-        .zip(ids.iter())
-        .map(|(embedding, id)| {
-            let mut embedding: Vec<f32> = embedding.to_owned();
-
-            embedding.resize(1024, 0.0);
-
-            let hash = super::hash(id);
-
-            let embedding: [f32; 1024] = embedding.try_into().unwrap();
-
-            (embedding, hash, id.to_owned())
-        })
-        .collect();
-
     let mut tree = KdTree::with_capacity(100);
     let mut doc = HashMap::new();
 
-    for (embedding, hash, id) in data_vec {
+    for i in 0..data.len() {
+        let mut embedding: Vec<f32> = data[i].clone();
+        let id = ids[i].clone();
+
+        embedding.resize(1024, 0.0);
+
+        let hash = super::hash(&id);
+
+        let embedding: [f32; 1024] = embedding.try_into().unwrap();
+
         tree.add(&embedding, hash);
         doc.insert(hash, id);
     }
+
     Index { tree, hash: doc }
 }
 
@@ -77,30 +71,25 @@ pub fn add<'a>(
     Ok(())
 }
 
-pub fn remove<'a>(index: &'a mut Index, id: &'a String) -> Result<(), EngineError> {
-    let hash = super::hash(id);
+pub fn remove<'a>(index: &'a mut Index, ids: &'a Vec<String>) -> Result<(), EngineError> {
+    let mut embeddings: Vec<(u64, [f32; 1024])> = vec![];
 
-    let hit = index.hash.remove(&hash);
-
-    if hit.is_none() {
-        return Err(EngineError::new(format!("Id {} not found", id)));
-    }
-
-    let mut embedding: Option<[f32; 1024]> = None;
+    let hash_ids = ids.iter().map(|id| super::hash(id)).collect::<Vec<u64>>();
 
     for (vector_hash, vector) in index.tree.iter() {
-        if vector_hash == hash {
-            embedding = Some(vector);
-            break;
+        if hash_ids.contains(&vector_hash) {
+            embeddings.push((vector_hash, vector.clone()));
+            continue;
         }
+        return Err(EngineError::new(format!("Id {} not found", index.hash.get(&vector_hash).unwrap())));
     }
 
-    if let Some(embedding) = embedding {
-        index.tree.remove(&embedding, hash);
-        Ok(())
-    } else {
-        Err(EngineError::new(format!("Id {} not found", id)))
+    for (vector_hash, vector) in embeddings {
+        index.hash.remove(&vector_hash);
+        index.tree.remove(&vector, vector_hash);
     }
+
+    Ok(())
 }
 
 pub fn size<'a>(index: &'a Index) -> u64 {
