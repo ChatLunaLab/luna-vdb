@@ -49,14 +49,14 @@ impl LunaVDB {
 
     pub fn add(&mut self, resource: Resource) {
         for res in resource.embeddings {
-            engine::add(&mut self.index, &res.id, &res.embeddings);
+            engine::add(&mut self.index, &res.id, &res.embeddings).unwrap()
         }
     }
 
-    pub fn remove(&mut self, resource: Resource) -> bool {
+    pub fn remove(&mut self, ids: Vec<String>) -> bool {
         let mut success = true;
-        for res in resource.embeddings {
-            if engine::remove(&mut self.index, &res.id).is_err() {
+        for id in ids {
+            if engine::remove(&mut self.index, &id).is_err() {
                 success = false;
             }
         }
@@ -67,7 +67,7 @@ impl LunaVDB {
         engine::clear(&mut self.index);
     }
 
-    pub fn size(&self) -> usize {
+    pub fn size(&self) -> u64 {
         engine::size(&self.index)
     }
 

@@ -22,7 +22,7 @@ pub fn index<'a>(data: &'a Vec<Embedding>, ids: &'a Vec<String>) -> Index {
         })
         .collect();
 
-    let mut tree = KdTree::new();
+    let mut tree = KdTree::with_capacity(100);
     let mut doc = HashMap::new();
 
     for (embedding, hash, id) in data_vec {
@@ -54,17 +54,27 @@ pub fn search<'a>(index: &'a Index, query: &'a Embedding, k: usize) -> Vec<Strin
     result
 }
 
-pub fn add<'a>(index: &'a mut Index, id: &'a String, query: &'a Embedding) {
+pub fn add<'a>(
+    index: &'a mut Index,
+    id: &'a String,
+    query: &'a Embedding,
+) -> Result<(), EngineError> {
+    let hash = super::hash(id);
+
+    if index.hash.contains_key(&hash) {
+        return Err(EngineError::new(format!("Id {} already exists", id)));
+    }
+
     let mut query: Vec<f32> = query.clone();
 
     query.resize(1024, 0.0);
 
     let query: &[f32; 1024] = &query.try_into().unwrap();
 
-    let hash = super::hash(id);
-
     index.hash.insert(hash, id.to_owned());
     index.tree.add(query, hash);
+
+    Ok(())
 }
 
 pub fn remove<'a>(index: &'a mut Index, id: &'a String) -> Result<(), EngineError> {
@@ -93,8 +103,9 @@ pub fn remove<'a>(index: &'a mut Index, id: &'a String) -> Result<(), EngineErro
     }
 }
 
-pub fn size<'a>(index: &'a Index) -> usize {
-    index.hash.len()
+pub fn size<'a>(index: &'a Index) -> u64 {
+    assert_eq!(index.tree.size(), index.hash.len() as u64);
+    index.hash.len() as u64
 }
 
 pub fn clear<'a>(index: &'a mut Index) {
