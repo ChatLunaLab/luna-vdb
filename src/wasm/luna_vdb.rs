@@ -61,7 +61,7 @@ impl LunaVDB {
         engine::clear(&mut self.index);
     }
 
-    pub fn size(&self) -> u64 {
+    pub fn size(&self) -> usize {
         engine::size(&self.index)
     }
 

@@ -75,7 +75,7 @@ pub fn add(
     Ok(())
 }
 
-pub fn remove(index: &mut Index, ids: & Vec<String>) -> Result<(), EngineError> {
+pub fn remove(index: &mut Index, ids: &Vec<String>) -> Result<(), EngineError> {
     let mut embeddings: Vec<(u64, [f32; 1024])> = vec![];
 
     let hash_ids = ids.iter().map(|id| super::hash(id)).collect::<Vec<u64>>();
@@ -99,9 +99,9 @@ pub fn remove(index: &mut Index, ids: & Vec<String>) -> Result<(), EngineError> 
     Ok(())
 }
 
-pub fn size(index: &Index) -> u64 {
+pub fn size(index: &Index) -> usize {
     assert_eq!(index.tree.size(), index.hash.len() as u64);
-    index.hash.len() as u64
+    index.hash.len()
 }
 
 pub fn clear(index: &mut Index) {

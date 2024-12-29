@@ -400,7 +400,7 @@ fn test_luna_vdb_dynamic_operations() {
 
     console_log!("Removing {} vectors", remove_count);
     luna_vdb.remove(to_remove);
-    assert_eq!(luna_vdb.size(), (400 - remove_count) as u64);
+    assert_eq!(luna_vdb.size(), 400 - remove_count);
 
     // 添加新的向量
     let new_embeddings = generate_test_data(100, 32);
