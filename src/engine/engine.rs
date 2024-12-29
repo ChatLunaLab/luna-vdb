@@ -13,7 +13,9 @@ pub fn index<'a>(data: &'a Vec<Embedding>, ids: &'a Vec<String>) -> Index {
         let mut embedding: Vec<f32> = data[i].clone();
         let id = ids[i].clone();
 
-        embedding.resize(1024, 0.0);
+        if embedding.len() != 1024 {  
+            embedding.resize(1024, 0.0);
+        }
 
         let hash = super::hash(&id);
 
@@ -29,7 +31,9 @@ pub fn index<'a>(data: &'a Vec<Embedding>, ids: &'a Vec<String>) -> Index {
 pub fn search<'a>(index: &'a Index, query: &'a Embedding, k: usize) -> Vec<String> {
     let mut query: Vec<f32> = query.clone();
 
-    query.resize(1024, 0.0);
+    if query.len() != 1024 {  
+        query.resize(1024, 0.0);
+    }
 
     let query: &[f32; 1024] = &query.try_into().unwrap();
 
