@@ -28,7 +28,10 @@
         "build:cargo": "cargo build --release --target wasm32-unknown-unknown",
         "build:web": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/web --target web",
         "build:node": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/nodejs --target nodejs",
-        "pub": "cross-env-shell node ./scripts/publish.js"
+        "pub": "cross-env-shell node ./scripts/publish.js",
+        "test": "run-s test:web test:node",
+        "test:web": "wasm-pack test --chrome",
+        "test:node": "wasm-pack test --node"
     },
     "files": [
         "pkg/**/*",

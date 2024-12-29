@@ -1,4 +1,7 @@
 use crate::engine::types::*;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use kiddo::float::{distance::SquaredEuclidean, kdtree::KdTree};
 use std::{collections::HashMap, convert::TryInto};
 
@@ -99,38 +102,17 @@ pub fn clear<'a>(index: &'a mut Index) {
     index.hash = HashMap::new();
 }
 
-pub fn dump<'a>(index: &'a mut Index) -> String {
-    // Wasm64 is experimental, so we can't use it yet.
-   /*  let mut serialize_buffer = AlignedVec::with_capacity(BUFFER_LEN);
-    let mut serialize_scratch = AlignedVec::with_capacity(SCRATCH_LEN);
+pub fn dump<'a>(index: &'a mut Index) -> Result<Vec<u8>, std::io::Error> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    bincode::serialize_into(&mut encoder, &index).unwrap();
 
-    unsafe { serialize_scratch.set_len(SCRATCH_LEN) };
-    serialize_buffer.clear();
-
-    let mut serializer = CompositeSerializer::new(
-        AlignedSerializer::new(&mut serialize_buffer),
-        BufferScratch::new(&mut serialize_scratch),
-        Infallible,
-    );
-
-    serializer
-        .serialize_value(index)
-        .expect("Could not serialize with rkyv");
-
-    let buf = serializer.into_serializer().into_inner();
-
-    buf.to_vec() */
-
-    return serde_json::to_string(index).unwrap()
+    encoder.finish()
 }
 
-pub fn load<'a>(data: &'a String) -> Index {
-    // Wasm64 is experimental, so we can't use it yet.
-   /*  let archived = unsafe { rkyv::archived_root::<Index>(&data[..]) };
+pub fn load<'a>(data: &'a Vec<u8>) -> Index {
+    let mut decoder = GzDecoder::new(std::io::Cursor::new(data));
 
-    // And you can always deserialize back to the original type
-    let deserialized = archived.deserialize(&mut rkyv::Infallible).unwrap();
-    return deserialized; */
+    let index: Index = bincode::deserialize_from(&mut decoder).unwrap();
 
-    serde_json::from_str::<Index>(data).unwrap()
+    return index;
 }

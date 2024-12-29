@@ -15,7 +15,7 @@ pub type Embedding = Vec<f32>;
 
 pub type Tree = KdTree<f32, u64, 1024, BUCKET_SIZE, u32>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Index {
     pub tree: Tree,
     pub hash: HashMap<u64, String>,

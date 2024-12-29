@@ -72,10 +72,12 @@ impl LunaVDB {
     }
 
     pub fn serialize(&mut self) -> SerializedIndex {
-        engine::dump(&mut self.index)
+        engine::dump(&mut self.index).unwrap()
     }
 
-    pub fn deserialize(&mut self, index: SerializedIndex) {
-        self.index = engine::load(&index);
+    pub fn deserialize(index: SerializedIndex) -> LunaVDB {
+        let index = engine::load(&index);
+
+        LunaVDB { index }
     }
 }
