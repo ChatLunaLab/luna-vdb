@@ -5,7 +5,7 @@ use flate2::Compression;
 use kiddo::float::{distance::SquaredEuclidean, kdtree::KdTree};
 use std::{collections::HashMap, convert::TryInto};
 
-pub fn index<'a>(data: &'a Vec<Embedding>, ids: &'a Vec<String>) -> Index {
+pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
     let mut tree = KdTree::with_capacity(100);
     let mut doc = HashMap::new();
 
@@ -28,7 +28,7 @@ pub fn index<'a>(data: &'a Vec<Embedding>, ids: &'a Vec<String>) -> Index {
     Index { tree, hash: doc }
 }
 
-pub fn search<'a>(index: &'a Index, query: &'a Embedding, k: usize) -> Vec<String> {
+pub fn search(index: &Index, query: &Embedding, k: usize) -> Vec<String> {
     let mut query: Vec<f32> = query.clone();
 
     if query.len() != 1024 {  
@@ -52,10 +52,10 @@ pub fn search<'a>(index: &'a Index, query: &'a Embedding, k: usize) -> Vec<Strin
     result
 }
 
-pub fn add<'a>(
-    index: &'a mut Index,
-    id: &'a String,
-    query: &'a Embedding,
+pub fn add(
+    index: &mut Index,
+    id: &String,
+    query: &Embedding,
 ) -> Result<(), EngineError> {
     let hash = super::hash(id);
 
@@ -75,7 +75,7 @@ pub fn add<'a>(
     Ok(())
 }
 
-pub fn remove<'a>(index: &'a mut Index, ids: &'a Vec<String>) -> Result<(), EngineError> {
+pub fn remove(index: &mut Index, ids: & Vec<String>) -> Result<(), EngineError> {
     let mut embeddings: Vec<(u64, [f32; 1024])> = vec![];
 
     let hash_ids = ids.iter().map(|id| super::hash(id)).collect::<Vec<u64>>();
@@ -99,24 +99,24 @@ pub fn remove<'a>(index: &'a mut Index, ids: &'a Vec<String>) -> Result<(), Engi
     Ok(())
 }
 
-pub fn size<'a>(index: &'a Index) -> u64 {
+pub fn size(index: &Index) -> u64 {
     assert_eq!(index.tree.size(), index.hash.len() as u64);
     index.hash.len() as u64
 }
 
-pub fn clear<'a>(index: &'a mut Index) {
+pub fn clear(index: &mut Index) {
     index.tree = Tree::new();
     index.hash = HashMap::new();
 }
 
-pub fn dump<'a>(index: &'a mut Index) -> Result<Vec<u8>, std::io::Error> {
+pub fn dump(index: &mut Index) -> Result<Vec<u8>, std::io::Error> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     bincode::serialize_into(&mut encoder, &index).unwrap();
 
     encoder.finish()
 }
 
-pub fn load<'a>(data: &'a Vec<u8>) -> Index {
+pub fn load(data: &Vec<u8>) -> Index {
     let mut decoder = GzDecoder::new(std::io::Cursor::new(data));
 
     let index: Index = bincode::deserialize_from(&mut decoder).unwrap();
