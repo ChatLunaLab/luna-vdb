@@ -16,6 +16,7 @@ macro_rules! console_log {
 wasm_bindgen_test_configure!(run_in_browser);
 
 
+
 fn random_number() -> i32 {
     use getrandom::getrandom;
 
@@ -58,10 +59,11 @@ fn generate_test_data(count: usize, dim: usize) -> Vec<EmbeddedResource> {
     resources
 }
 
-
 #[wasm_bindgen_test]
 fn test_luna_vdb_basic() {
+   
     console_log!("Starting test_luna_vdb_basic");
+    
     let mut luna_vdb = LunaVDB::new(None);
     assert_eq!(luna_vdb.size(), 0);
 
@@ -79,11 +81,14 @@ fn test_luna_vdb_basic() {
     let resource = Resource { embeddings };
     luna_vdb.index(resource);
     assert_eq!(luna_vdb.size(), 2);
+
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_search() {
+   
     console_log!("Starting test_luna_vdb_search");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 创建一组相似度不同的文本向量
@@ -161,11 +166,14 @@ fn test_luna_vdb_search() {
     assert!(result_set.contains("bird"));
     assert!(result_set.contains("fish"));
     assert!(result_set.contains("car"));
+
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_add_remove() {
+   
     console_log!("Starting test_luna_vdb_add_remove");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 测试添加
@@ -179,13 +187,17 @@ fn test_luna_vdb_add_remove() {
 
     // 测试移除 - 使用新的方式
     let ids = vec!["3".to_string()];
-    assert!(luna_vdb.remove(ids));
+    luna_vdb.remove(ids);
     assert_eq!(luna_vdb.size(), 0);
+
+
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_serialization() {
+   
     console_log!("Starting test_luna_vdb_serialization");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 添加一些数据
@@ -210,11 +222,14 @@ fn test_luna_vdb_serialization() {
     let original_results = luna_vdb.search(query.clone(), 1);
     let new_results = new_luna_vdb.search(query, 1);
     assert_eq!(original_results, new_results);
+
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_clear() {
+   
     console_log!("Starting test_luna_vdb_clear");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 添加数据
@@ -229,11 +244,15 @@ fn test_luna_vdb_clear() {
     // 测试清空
     luna_vdb.clear();
     assert_eq!(luna_vdb.size(), 0);
+
+   
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_large_dataset() {
+   
     console_log!("Starting test_luna_vdb_large_dataset");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 生成1000个128维的测试向量
@@ -259,11 +278,14 @@ fn test_luna_vdb_large_dataset() {
     };
     luna_vdb.add(new_resource);
     assert_eq!(luna_vdb.size(), 1100);
+
+
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_edge_cases() {
     console_log!("Starting test_luna_vdb_edge_cases");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 测试极端值
@@ -312,11 +334,15 @@ fn test_luna_vdb_edge_cases() {
         let results = luna_vdb.search(query.clone(), 4);
         assert_eq!(results.len(), 4);
     }
+
+
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_persistence() {
+   
     console_log!("Starting test_luna_vdb_persistence");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 生成大量测试数据
@@ -343,11 +369,14 @@ fn test_luna_vdb_persistence() {
         let new_results = new_luna_vdb.search(query.embeddings.clone(), 5);
         assert_eq!(original_results, new_results);
     }
+
 }
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_dynamic_operations() {
+   
     console_log!("Starting test_luna_vdb_dynamic_operations");
+    
     let mut luna_vdb = LunaVDB::new(None);
 
     // 初始数据
@@ -390,4 +419,5 @@ fn test_luna_vdb_dynamic_operations() {
 
     let results = luna_vdb.search(complex_query, 20);
     assert_eq!(results.len(), 20);
+
 }

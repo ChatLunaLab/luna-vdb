@@ -81,7 +81,10 @@ pub fn remove<'a>(index: &'a mut Index, ids: &'a Vec<String>) -> Result<(), Engi
             embeddings.push((vector_hash, vector.clone()));
             continue;
         }
-        return Err(EngineError::new(format!("Id {} not found", index.hash.get(&vector_hash).unwrap())));
+    }
+
+    if hash_ids.len() !=embeddings.len() {
+        return Err(EngineError::new(format!("The ids {} not found", ids.join(","))));
     }
 
     for (vector_hash, vector) in embeddings {
