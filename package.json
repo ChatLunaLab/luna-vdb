@@ -1,0 +1,68 @@
+{
+    "name": "@chatluna/luna-vdb",
+    "version": "0.1.0",
+    "description": "lightweight vector database implementation in rust",
+    "keywords": [
+        "rust",
+        "vector",
+        "luna-vdb",
+        "chatluna"
+    ],
+    "license": "MIT",
+    "main": "./pkg/nodejs/luna_vdb.js",
+    "types": "./pkg/nodejs/luna_vdb.d.ts",
+    "exports": {
+        ".": {
+            "node": {
+                "types": "./pkg/nodejs/luna_vdb.d.ts",
+                "default": "./pkg/nodejs/luna_vdb.js"
+            },
+            "browser": {
+                "types": "./pkg/web/luna_vdb.d.ts",
+                "default": "./pkg/web/luna_vdb.js"
+            }
+        }
+    },
+    "scripts": {
+        "build": "wireit",
+        "build:cargo": "wireit",
+        "build:web": "wireit",
+        "build:node": "wireit"
+    },
+    "wireit": {
+        "build:cargo": {
+            "command": "cargo build --release --target wasm32-unknown-unknown"
+        },
+        "build:web": {
+            "command": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/web --target web",
+            "dependencies": [
+                "build:cargo"
+            ]
+        },
+        "build:node": {
+            "command": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/nodejs --target nodejs",
+            "dependencies": [
+                "build:cargo"
+            ]
+        },
+        "build": {
+            "dependencies": [
+                "build:cargo",
+                "build:web",
+                "build:node"
+            ]
+        }
+    },
+    "files": [
+        "pkg/**/*"
+    ],
+    "devDependencies": {
+        "wireit": "^0.14.4"
+    },
+    "author": "dingyi222666 <dingyi222666@foxmail.com>",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/ChatLunaLab/luna-vdb.git"
+    },
+    "packageManager": "yarn@4.5.0+sha512.837566d24eec14ec0f5f1411adb544e892b3454255e61fdef8fd05f3429480102806bac7446bc9daff3896b01ae4b62d00096c7e989f1596f2af10b927532f39"
+}
