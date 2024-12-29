@@ -1,6 +1,6 @@
 {
     "name": "@chatluna/luna-vdb",
-    "version": "0.1.0",
+    "version": "0.0.1",
     "description": "lightweight vector database implementation in rust",
     "keywords": [
         "rust",
@@ -24,40 +24,21 @@
         }
     },
     "scripts": {
-        "build": "wireit",
-        "build:cargo": "wireit",
-        "build:web": "wireit",
-        "build:node": "wireit"
-    },
-    "wireit": {
-        "build:cargo": {
-            "command": "cargo build --release --target wasm32-unknown-unknown"
-        },
-        "build:web": {
-            "command": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/web --target web",
-            "dependencies": [
-                "build:cargo"
-            ]
-        },
-        "build:node": {
-            "command": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/nodejs --target nodejs",
-            "dependencies": [
-                "build:cargo"
-            ]
-        },
-        "build": {
-            "dependencies": [
-                "build:cargo",
-                "build:web",
-                "build:node"
-            ]
-        }
+        "build": "run-s build:cargo build:web build:node",
+        "build:cargo": "cargo build --release --target wasm32-unknown-unknown",
+        "build:web": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/web --target web",
+        "build:node": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/nodejs --target nodejs",
+        "pub": "cross-env-shell node ./scripts/publish.js"
     },
     "files": [
-        "pkg/**/*"
+        "pkg/**/*",
+        "package.json",
+        "README.md"
     ],
     "devDependencies": {
-        "wireit": "^0.14.4"
+        "@wasm-tool/wasm-pack-plugin": "^1.7.0",
+        "cross-env": "^7.0.3",
+        "npm-run-all": "^4.1.5"
     },
     "author": "dingyi222666 <dingyi222666@foxmail.com>",
     "repository": {

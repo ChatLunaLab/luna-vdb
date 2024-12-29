@@ -2,9 +2,6 @@ use crate::engine::types::*;
 use kiddo::float::{distance::SquaredEuclidean, kdtree::KdTree};
 use std::{collections::HashMap, convert::TryInto};
 
-const BUFFER_LEN: usize = 1024 * 1024 * 1024;
-const SCRATCH_LEN: usize = 1024 * 1024;
-
 pub fn index<'a>(data: &'a Vec<Embedding>, ids: &'a Vec<String>) -> Index {
     let data_vec: Vec<([f32; 1024], u64, String)> = data
         .iter()

@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use tsify::Tsify;
-use crate::engine::Embedding;
 
 pub type TopK = usize;
 pub type SearchResult = Vec<String>;

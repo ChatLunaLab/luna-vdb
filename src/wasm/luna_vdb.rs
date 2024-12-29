@@ -1,4 +1,4 @@
-use crate::engine::{Embedding, EngineError};
+use crate::engine::Embedding;
 use crate::utils::set_panic_hook;
 use crate::{engine, wasm::*};
 
