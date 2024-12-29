@@ -82,7 +82,7 @@ pub fn remove(index: &mut Index, ids: &Vec<String>) -> Result<(), EngineError> {
 
     for (vector_hash, vector) in index.tree.iter() {
         if hash_ids.contains(&vector_hash) {
-            embeddings.push((vector_hash, vector.clone()));
+            embeddings.push((vector_hash, vector));
             continue;
         }
     }
