@@ -13,7 +13,7 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
         let mut embedding: Vec<f32> = data[i].clone();
         let id = ids[i].clone();
 
-        if embedding.len() != 1024 {  
+        if embedding.len() != 1024 {
             embedding.resize(1024, 0.0);
         }
 
@@ -31,7 +31,7 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
 pub fn search(index: &Index, query: &Embedding, k: usize) -> Vec<String> {
     let mut query: Vec<f32> = query.clone();
 
-    if query.len() != 1024 {  
+    if query.len() != 1024 {
         query.resize(1024, 0.0);
     }
 
@@ -52,11 +52,7 @@ pub fn search(index: &Index, query: &Embedding, k: usize) -> Vec<String> {
     result
 }
 
-pub fn add(
-    index: &mut Index,
-    id: &String,
-    query: &Embedding,
-) -> Result<(), EngineError> {
+pub fn add(index: &mut Index, id: &String, query: &Embedding) -> Result<(), EngineError> {
     let hash = super::hash(id);
 
     if index.hash.contains_key(&hash) {
@@ -87,8 +83,21 @@ pub fn remove(index: &mut Index, ids: &Vec<String>) -> Result<(), EngineError> {
         }
     }
 
-    if hash_ids.len() !=embeddings.len() {
-        return Err(EngineError::new(format!("The ids {} not found", ids.join(","))));
+    if hash_ids.len() != embeddings.len() {
+        let not_found_ids = hash_ids
+            .iter()
+            .filter(|id| {
+                !embeddings
+                    .iter()
+                    .any(|(vector_hash, _)| *vector_hash == **id)
+            })
+            .map(|id| index.hash.get(id).unwrap().to_owned())
+            .collect::<Vec<String>>();
+
+        return Err(EngineError::new(format!(
+            "The ids {} not found",
+            not_found_ids.join(",")
+        )));
     }
 
     for (vector_hash, vector) in embeddings {
