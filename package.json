@@ -31,7 +31,7 @@
         "pub": "cross-env-shell node ./scripts/publish.js",
         "bump": "cross-env-shell node ./scripts/bump.js",
         "test": "run-s test:web test:node",
-        "test:web": "wasm-pack test --chrome",
+        "test:web": "wasm-pack test --chrome --headless",
         "test:node": "wasm-pack test --node"
     },
     "files": [
