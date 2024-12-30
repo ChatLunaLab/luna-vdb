@@ -41,13 +41,13 @@ impl LunaVDB {
         self.index = index
     }
 
-    pub fn search(&self, query: Embedding, k: TopK) -> SearchResult {
-        engine::search(&self.index, &query, k)
+    pub fn search(&self, mut query: Embedding, k: TopK) -> SearchResult {
+        engine::search(&self.index, &mut query, k)
     }
 
     pub fn add(&mut self, resource: Resource) {
-        for res in resource.embeddings {
-            engine::add(&mut self.index, &res.id, &res.embeddings).unwrap()
+        for mut res in resource.embeddings {
+            engine::add(&mut self.index, res.id, &mut res.embeddings).unwrap()
         }
     }
 

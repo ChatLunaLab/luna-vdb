@@ -10,8 +10,8 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
     let mut doc = HashMap::new();
 
     for i in 0..data.len() {
-        let mut embedding: Vec<f32> = data[i].clone();
-        let id = ids[i].clone();
+        let mut embedding: Vec<f32> = data[i].to_owned();
+        let id = ids[i].to_owned();
 
         if embedding.len() != 1024 {
             embedding.resize(1024, 0.0);
@@ -28,16 +28,14 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
     Index { tree, hash: doc }
 }
 
-pub fn search(index: &Index, query: &Embedding, k: usize) -> SearchResult {
-    let mut query: Vec<f32> = query.clone();
-
+pub fn search(index: &Index, query: &mut Embedding, k: usize) -> SearchResult {
     if query.len() != 1024 {
         query.resize(1024, 0.0);
     }
 
-    let query: &[f32; 1024] = &query.try_into().unwrap();
+    let query: &[f32; 1024] = query.as_slice().try_into().unwrap();
 
-    let neighbors = index.tree.nearest_n::<SquaredEuclidean>(query, k);
+    let neighbors = index.tree.nearest_n::<SquaredEuclidean>(&query, k);
 
     let mut result: Vec<Neighbor> = vec![];
 
@@ -55,20 +53,20 @@ pub fn search(index: &Index, query: &Embedding, k: usize) -> SearchResult {
     SearchResult { neighbors: result }
 }
 
-pub fn add(index: &mut Index, id: &String, query: &Embedding) -> Result<(), EngineError> {
-    let hash = super::hash(id);
+pub fn add(index: &mut Index, id: String, query: &mut Embedding) -> Result<(), EngineError> {
+    let hash = super::hash(&id);
 
     if index.hash.contains_key(&hash) {
         return Err(EngineError::new(format!("Id {} already exists", id)));
     }
 
-    let mut query: Vec<f32> = query.clone();
+    if query.len() != 1024 {
+        query.resize(1024, 0.0);
+    }
 
-    query.resize(1024, 0.0);
+    let query: &[f32; 1024] = query.as_slice().try_into().unwrap();
 
-    let query: &[f32; 1024] = &query.try_into().unwrap();
-
-    index.hash.insert(hash, id.to_owned());
+    index.hash.insert(hash, id);
     index.tree.add(query, hash);
 
     Ok(())
@@ -131,7 +129,5 @@ pub fn dump(index: &mut Index) -> Result<Vec<u8>, std::io::Error> {
 pub fn load(data: &Vec<u8>) -> Index {
     let mut decoder = GzDecoder::new(std::io::Cursor::new(data));
 
-    let index: Index = bincode::deserialize_from(&mut decoder).unwrap();
-
-    return index;
+    bincode::deserialize_from::<_, Index>(&mut decoder).unwrap()
 }
