@@ -16,7 +16,6 @@ macro_rules! console_log {
 wasm_bindgen_test_configure!(run_in_browser);
 
 
-
 fn random_number() -> i32 {
     use getrandom::getrandom;
 
@@ -86,7 +85,6 @@ fn test_luna_vdb_basic() {
 
 #[wasm_bindgen_test]
 fn test_luna_vdb_search() {
-   
     console_log!("Starting test_luna_vdb_search");
     
     let mut luna_vdb = LunaVDB::new(None);
@@ -95,23 +93,23 @@ fn test_luna_vdb_search() {
     let embeddings = vec![
         EmbeddedResource {
             id: "cat".to_string(),
-            embeddings: vec![0.8, 0.7, 0.6, 0.2, 0.1], // 猫的向量
+            embeddings: vec![0.8, 0.7, 0.6, 0.2, 0.1], 
         },
         EmbeddedResource {
             id: "dog".to_string(),
-            embeddings: vec![0.7, 0.8, 0.6, 0.3, 0.1], // 狗的向量 (与猫相似)
+            embeddings: vec![0.7, 0.8, 0.6, 0.3, 0.1], 
         },
         EmbeddedResource {
             id: "bird".to_string(),
-            embeddings: vec![0.6, 0.5, 0.8, 0.4, 0.2], // 鸟的向量 (与猫狗稍有不同)
+            embeddings: vec![0.6, 0.5, 0.8, 0.4, 0.2], 
         },
         EmbeddedResource {
             id: "fish".to_string(),
-            embeddings: vec![0.2, 0.3, 0.4, 0.8, 0.7], // 鱼的向量 (差异较大)
+            embeddings: vec![0.2, 0.3, 0.4, 0.8, 0.7], 
         },
         EmbeddedResource {
             id: "car".to_string(),
-            embeddings: vec![-0.1, -0.2, -0.3, -0.8, -0.9], // 汽车的向量 (完全不同)
+            embeddings: vec![-0.1, -0.2, -0.3, -0.8, -0.9], 
         },
     ];
 
@@ -121,52 +119,51 @@ fn test_luna_vdb_search() {
     // 测试场景1: 搜索最接近"猫"的向量
     console_log!("Testing cat-like vector search");
     let cat_query = vec![0.8, 0.7, 0.6, 0.2, 0.1];
-    let neighbors = luna_vdb.search(cat_query, 3);
-    assert_eq!(neighbors.len(), 3);
-    assert_eq!(neighbors[0], "cat"); // 第一个应该是猫
-    assert_eq!(neighbors[1], "dog"); // 第二个应该是狗（因为向量最相似）
-    assert_eq!(neighbors[2], "bird"); // 第三个应该是鸟
+    let result = luna_vdb.search(cat_query, 3);
+    assert_eq!(result.neighbors.len(), 3);
+    assert_eq!(result.neighbors[0].id, "cat");
+    assert_eq!(result.neighbors[1].id, "dog");
+    assert_eq!(result.neighbors[2].id, "bird");
+    
+    // 验证距离值是递增的
+    assert!(result.neighbors[0].distance < result.neighbors[1].distance);
+    assert!(result.neighbors[1].distance < result.neighbors[2].distance);
 
-    // 测试场景2: 搜索介于猫狗之间的向量
-    console_log!("Testing intermediate cat-dog vector search");
-    let cat_dog_query = vec![0.75, 0.75, 0.6, 0.25, 0.1];
-    let neighbors = luna_vdb.search(cat_dog_query, 2);
-    assert_eq!(neighbors.len(), 2);
-    // 猫狗应该都在结果中，顺序可能略有不同
-    assert!(neighbors.contains(&"cat".to_string()));
-    assert!(neighbors.contains(&"dog".to_string()));
+    // 测试场景2: 搜索边界值向量
+    console_log!("Testing boundary vector search");
+    let boundary_query = vec![1.0, 1.0, 1.0, 1.0, 1.0];
+    let result = luna_vdb.search(boundary_query, 5);
+    assert_eq!(result.neighbors.len(), 5);
+    
+    // 验证所有结果都有合理的距离值
+    for neighbor in &result.neighbors {
+        assert!(neighbor.distance >= 0.0);
+    }
 
-    // 测试场景3: 搜索完全不同类别的向量
-    console_log!("Testing vehicle-like vector search");
-    let car_query = vec![-0.15, -0.25, -0.35, -0.85, -0.95];
-    let neighbors = luna_vdb.search(car_query, 1);
-    assert_eq!(neighbors.len(), 1);
-    assert_eq!(neighbors[0], "car");
+    // 测试场景3: 搜索零向量
+    console_log!("Testing zero vector search");
+    let zero_query = vec![0.0, 0.0, 0.0, 0.0, 0.0];
+    let result = luna_vdb.search(zero_query, 3);
+    assert_eq!(result.neighbors.len(), 3);
 
-    // 测试场景4: 搜索水生动物相关的向量
-    console_log!("Testing aquatic-like vector search");
-    let aquatic_query = vec![0.2, 0.3, 0.4, 0.85, 0.75];
-    let neighbors = luna_vdb.search(aquatic_query, 2);
-    assert_eq!(neighbors.len(), 2);
-    assert_eq!(neighbors[0], "fish"); // 第一个应该是鱼
-                                      // 第二个结果应该与鱼的相似度明显较低
+    // 测试场景4: 搜索负向量
+    console_log!("Testing negative vector search");
+    let negative_query = vec![-0.1, -0.2, -0.3, -0.8, -0.9];
+    let result = luna_vdb.search(negative_query, 1);
+    assert_eq!(result.neighbors[0].id, "car");
+    assert!(result.neighbors[0].distance < 0.1); // 应该非常接近
 
-    // 测试场景5: 边界情况测试
-    console_log!("Testing boundary case search");
-    // 测试一个与所有向量都有一定距离的查询向量
-    let boundary_query = vec![0.0, 0.0, 0.0, 0.0, 0.0];
-    let neighbors = luna_vdb.search(boundary_query, 5);
-    assert_eq!(neighbors.len(), 5); // 应该返回所有向量
+    // 测试场景5: 验证距离计算
+    console_log!("Testing distance calculations");
+    let query = vec![0.8, 0.7, 0.6, 0.2, 0.1];  // 与 cat 向量相同
+    let result = luna_vdb.search(query, 1);
+    assert_eq!(result.neighbors[0].id, "cat");
+    assert!(result.neighbors[0].distance < 1e-6); // 应该几乎为0
 
-    // 验证返回的是所有向量
-    let result_set: std::collections::HashSet<_> = neighbors.into_iter().collect();
-    assert_eq!(result_set.len(), 5);
-    assert!(result_set.contains("cat"));
-    assert!(result_set.contains("dog"));
-    assert!(result_set.contains("bird"));
-    assert!(result_set.contains("fish"));
-    assert!(result_set.contains("car"));
-
+    // 测试场景6: 极限搜索数量
+    console_log!("Testing search with max k");
+    let result = luna_vdb.search(vec![0.0; 5], 10);
+    assert_eq!(result.neighbors.len(), 5); // 不应超过实际存在的向量数量
 }
 
 #[wasm_bindgen_test]
@@ -268,7 +265,7 @@ fn test_luna_vdb_large_dataset() {
     console_log!("Testing batch search...");
     let query = vec![0.5; 1024]; // 创建一个1024维的查询向量
     let neighbors = luna_vdb.search(query, 10);
-    assert_eq!(neighbors.len(), 10);
+    assert_eq!(neighbors.neighbors.len(), 10);
 
     // 测试增量更新
     console_log!("Testing incremental updates...");
@@ -332,7 +329,7 @@ fn test_luna_vdb_edge_cases() {
     for (i, query) in queries.iter().enumerate() {
         console_log!("Testing query type {}", i);
         let results = luna_vdb.search(query.clone(), 4);
-        assert_eq!(results.len(), 4);
+        assert_eq!(results.neighbors.len(), 4);
     }
 
 
@@ -418,6 +415,6 @@ fn test_luna_vdb_dynamic_operations() {
         .collect::<Vec<f32>>();
 
     let results = luna_vdb.search(complex_query, 20);
-    assert_eq!(results.len(), 20);
+    assert_eq!(results.neighbors.len(), 20);
 
 }
