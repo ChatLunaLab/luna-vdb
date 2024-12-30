@@ -28,12 +28,15 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
     Index { tree, hash: doc }
 }
 
-pub fn search(index: &Index, query: &mut Embedding, k: usize) -> SearchResult {
+pub fn search(index: &Index, query: &Embedding, k: usize) -> SearchResult {
+    let mut query: Vec<f32> = query.to_owned();
+
     if query.len() != 1024 {
         query.resize(1024, 0.0);
     }
 
-    let query: &[f32; 1024] = query.as_slice().try_into().unwrap();
+    let query: &[f32; 1024] = &query.try_into().unwrap();
+
 
     let neighbors = index.tree.nearest_n::<SquaredEuclidean>(&query, k);
 
@@ -53,18 +56,21 @@ pub fn search(index: &Index, query: &mut Embedding, k: usize) -> SearchResult {
     SearchResult { neighbors: result }
 }
 
-pub fn add(index: &mut Index, id: String, query: &mut Embedding) -> Result<(), EngineError> {
+pub fn add(index: &mut Index, id: String, query: &Embedding) -> Result<(), EngineError> {
     let hash = super::hash(&id);
 
     if index.hash.contains_key(&hash) {
         return Err(EngineError::new(format!("Id {} already exists", id)));
     }
 
+    let mut query: Vec<f32> = query.to_owned();
+
     if query.len() != 1024 {
         query.resize(1024, 0.0);
     }
 
-    let query: &[f32; 1024] = query.as_slice().try_into().unwrap();
+    let query: &[f32; 1024] = &query.try_into().unwrap();
+
 
     index.hash.insert(hash, id);
     index.tree.add(query, hash);
