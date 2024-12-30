@@ -1,6 +1,6 @@
 {
   "name": "@chatluna/luna-vdb",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "description": "lightweight vector database implementation in rust",
   "keywords": [
     "rust",
