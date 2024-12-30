@@ -1,6 +1,6 @@
 {
   "name": "@chatluna/luna-vdb",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "lightweight vector database implementation in rust",
   "keywords": [
     "rust",
@@ -20,6 +20,14 @@
       "browser": {
         "types": "./pkg/web/luna_vdb.d.ts",
         "default": "./pkg/web/luna_vdb.js"
+      },
+      "import": {
+        "types": "./pkg/web/luna_vdb.d.ts",
+        "default": "./pkg/web/luna_vdb.js"
+      },
+      "require": {
+        "types": "./pkg/nodejs/luna_vdb.d.ts",
+        "default": "./pkg/nodejs/luna_vdb.js"
       }
     }
   },
