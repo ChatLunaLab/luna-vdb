@@ -1,4 +1,4 @@
-use crate::engine::types::*;
+use crate::{engine::types::*, Neighbor, SearchResult};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -28,7 +28,7 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
     Index { tree, hash: doc }
 }
 
-pub fn search(index: &Index, query: &Embedding, k: usize) -> Vec<String> {
+pub fn search(index: &Index, query: &Embedding, k: usize) -> SearchResult {
     let mut query: Vec<f32> = query.clone();
 
     if query.len() != 1024 {
@@ -39,17 +39,20 @@ pub fn search(index: &Index, query: &Embedding, k: usize) -> Vec<String> {
 
     let neighbors = index.tree.nearest_n::<SquaredEuclidean>(query, k);
 
-    let mut result: Vec<String> = vec![];
+    let mut result: Vec<Neighbor> = vec![];
 
     for neighbor in &neighbors {
         let id = index.hash.get(&neighbor.item);
 
         if id.is_some() {
-            result.push(id.unwrap().to_owned());
+            result.push(Neighbor {
+                id: id.unwrap().to_owned(),
+                distance: neighbor.distance,
+            });
         }
     }
 
-    result
+    SearchResult { neighbors: result }
 }
 
 pub fn add(index: &mut Index, id: &String, query: &Embedding) -> Result<(), EngineError> {

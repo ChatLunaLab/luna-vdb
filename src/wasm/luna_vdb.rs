@@ -42,9 +42,7 @@ impl LunaVDB {
     }
 
     pub fn search(&self, query: Embedding, k: TopK) -> SearchResult {
-        let neighbors = engine::search(&self.index, &query, k);
-
-        return neighbors;
+        engine::search(&self.index, &query, k)
     }
 
     pub fn add(&mut self, resource: Resource) {
