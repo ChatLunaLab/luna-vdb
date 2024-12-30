@@ -11,9 +11,11 @@ use std::{
 // More detail: https://v8.dev/blog/4gb-wasm-memory
 const BUCKET_SIZE: usize = 32;
 
+pub const EMBEDDING_DIMENSION: usize = 1024;
+
 pub type Embedding = Vec<f32>;
 
-pub type Tree = KdTree<f32, u64, 1024, BUCKET_SIZE, u16>;
+pub type Tree = KdTree<f32, u64, EMBEDDING_DIMENSION, BUCKET_SIZE, u16>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Index {

@@ -13,13 +13,13 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
         let mut embedding: Vec<f32> = data[i].to_owned();
         let id = ids[i].to_owned();
 
-        if embedding.len() != 1024 {
-            embedding.resize(1024, 0.0);
+        if embedding.len() != EMBEDDING_DIMENSION {
+            embedding.resize(EMBEDDING_DIMENSION, 0.0);
         }
 
         let hash = super::hash(&id);
 
-        let embedding: [f32; 1024] = embedding.try_into().unwrap();
+        let embedding: [f32; EMBEDDING_DIMENSION] = embedding.try_into().unwrap();
 
         tree.add(&embedding, hash);
         doc.insert(hash, id);
@@ -31,11 +31,11 @@ pub fn index(data: &Vec<Embedding>, ids: &Vec<String>) -> Index {
 pub fn search(index: &Index, query: &Embedding, k: usize) -> SearchResult {
     let mut query: Vec<f32> = query.to_owned();
 
-    if query.len() != 1024 {
-        query.resize(1024, 0.0);
+    if query.len() != EMBEDDING_DIMENSION {
+        query.resize(EMBEDDING_DIMENSION, 0.0);
     }
 
-    let query: &[f32; 1024] = &query.try_into().unwrap();
+    let query: &[f32; EMBEDDING_DIMENSION] = &query.try_into().unwrap();
 
 
     let neighbors = index.tree.nearest_n::<SquaredEuclidean>(&query, k);
@@ -65,11 +65,11 @@ pub fn add(index: &mut Index, id: String, query: &Embedding) -> Result<(), Engin
 
     let mut query: Vec<f32> = query.to_owned();
 
-    if query.len() != 1024 {
-        query.resize(1024, 0.0);
+    if query.len() != EMBEDDING_DIMENSION {
+        query.resize(EMBEDDING_DIMENSION, 0.0);
     }
 
-    let query: &[f32; 1024] = &query.try_into().unwrap();
+    let query: &[f32; EMBEDDING_DIMENSION] = &query.try_into().unwrap();
 
 
     index.hash.insert(hash, id);
@@ -79,7 +79,7 @@ pub fn add(index: &mut Index, id: String, query: &Embedding) -> Result<(), Engin
 }
 
 pub fn remove(index: &mut Index, ids: &Vec<String>) -> Result<(), EngineError> {
-    let mut embeddings: Vec<(u64, [f32; 1024])> = vec![];
+    let mut embeddings: Vec<(u64, [f32; EMBEDDING_DIMENSION])> = vec![];
 
     let hash_ids = ids.iter().map(|id| super::hash(id)).collect::<Vec<u64>>();
 
