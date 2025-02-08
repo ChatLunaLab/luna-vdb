@@ -11,7 +11,7 @@ use std::{
 // More detail: https://v8.dev/blog/4gb-wasm-memory
 const BUCKET_SIZE: usize = 32;
 
-pub const EMBEDDING_DIMENSION: usize = 1024;
+pub const EMBEDDING_DIMENSION: usize = 2048;
 
 pub type Embedding = Vec<f32>;
 
