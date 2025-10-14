@@ -1,6 +1,6 @@
 {
   "name": "@chatluna/luna-vdb",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "description": "lightweight vector database implementation in rust",
   "keywords": [
     "rust",
@@ -36,8 +36,8 @@
     "build:cargo": "cargo build --release --target wasm32-unknown-unknown",
     "build:web": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/web --target web",
     "build:node": "wasm-bindgen target/wasm32-unknown-unknown/release/luna_vdb.wasm --out-dir ./pkg/nodejs --target nodejs",
-    "pub": "cross-env-shell node ./scripts/publish.js",
-    "bump": "cross-env-shell node ./scripts/bump.js",
+    "pub": "tsx ./scripts/publish.ts",
+    "bump": "tsx ./scripts/bump.ts",
     "test": "run-s test:native test:web test:node",
     "test:native": "cargo test --test native",
     "test:web": "wasm-pack test --chrome --headless",
@@ -49,8 +49,10 @@
     "README.md"
   ],
   "devDependencies": {
-    "cross-env": "^7.0.3",
-    "npm-run-all": "^4.1.5"
+    "@types/node": "^22.10.5",
+    "npm-run-all": "^4.1.5",
+    "semver": "^7.6.3",
+    "tsx": "^4.19.2"
   },
   "author": "dingyi222666 <dingyi222666@foxmail.com>",
   "repository": {
