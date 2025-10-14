@@ -10,10 +10,10 @@ _轻量级，本地的 Wasm 向量数据库。_
 
 ## 特性
 
-- Rust + WebAssembly，浏览器和 Node.js 即可使用
-- 简易 API，涵盖向量索引、增量更新、搜索与清空
+- Rust + WebAssembly，浏览器和 Node.js 均可使用
+- 简单，灵活的 API，涵盖向量索引、增量更新、搜索与清空。使用 ID 标注文档。
 - 支持序列化/反序列化
-- 内置 TypeScript 类型定义
+- TypeScript 类型支持
 
 ## 快速开始
 
@@ -30,7 +30,7 @@ import { LunaVDB } from "@chatluna/luna-vdb";
 
 const engine = new LunaVDB();
 
-// 批量索引一组向量
+// 初始化一组向量
 engine.index({
   embeddings: [
     { id: "cat", embeddings: [0.8, 0.7, 0.6] },
@@ -38,7 +38,7 @@ engine.index({
   ],
 });
 
-// 搜索最相近的两个向量，查询需使用 Float32Array
+// 搜索最相近的两个向量
 const result = engine.search(new Float32Array([0.75, 0.65, 0.55]), 2);
 result.neighbors.forEach(({ id, distance }) => {
   console.log(`${id}: ${distance}`);
@@ -60,7 +60,7 @@ const restored = LunaVDB.deserialize(snapshot);
 console.log(restored.size()); // => 当前向量数量
 ```
 
-> 在浏览器环境中以相同方式使用，只需通过 `import`/`await import` 加载打包后的模块即可。
+> 在浏览器环境中以相同方式使用，只需通过 `import`/`await import` 加载打包后的 WASM 模块即可。
 
 ## 感谢
 
