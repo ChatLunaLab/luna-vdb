@@ -37,8 +37,7 @@ impl LunaVDB {
             .map(|res| (res.embeddings, res.id))
             .unzip();
 
-        let index = engine::index(&data, &ids);
-        self.index = index
+        self.index = engine::index(&data, &ids);
     }
 
     pub fn search(&self, query: Embedding, k: TopK) -> SearchResult {
@@ -63,8 +62,8 @@ impl LunaVDB {
         engine::size(&self.index)
     }
 
-    pub fn serialize(&mut self) -> SerializedIndex {
-        engine::dump(&mut self.index).unwrap()
+    pub fn serialize(&self) -> SerializedIndex {
+        engine::dump(&self.index).unwrap()
     }
 
     pub fn deserialize(index: SerializedIndex) -> LunaVDB {

@@ -11,9 +11,10 @@ _轻量级，本地的 Wasm 向量数据库。_
 ## 特性
 
 1. 轻量级 API，支持序列化和反序列化
-2. 基于 Wasm，支持浏览器和 Node.js
+2. 基于 Rust，编译到 Wasm，支持浏览器和 Node.js
 
 ## 感谢
 
+- [tinyvector](https://github.com/m1guelpf/tinyvector)
 - [Voy](https://github.com/tantaraio/voy)
 - [kiddo](https://github.com/sdd/kiddo)

@@ -1,4 +1,3 @@
-use kiddo::float::kdtree::KdTree;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::{
@@ -6,21 +5,64 @@ use std::{
     fmt::{Display, Formatter, Result as FmtResult},
 };
 
-// Wasm has a 4GB memory limit. Should make sure the bucket size and capacity
-// doesn't exceed it and cause stack overflow.
-// More detail: https://v8.dev/blog/4gb-wasm-memory
-const BUCKET_SIZE: usize = 32;
-
-pub const EMBEDDING_DIMENSION: usize = 2048;
-
 pub type Embedding = Vec<f32>;
 
-pub type Tree = KdTree<f32, u64, EMBEDDING_DIMENSION, BUCKET_SIZE, u16>;
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Distance {
+    #[serde(rename = "euclidean")]
+    Euclidean,
+    #[serde(rename = "cosine")]
+    Cosine,
+    #[serde(rename = "dot")]
+    DotProduct,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VectorData {
+    pub vector: Vec<f32>,
+    pub cache_attr: f32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProductQuantizer {
+    pub m: usize,
+    pub ksub: usize,
+    pub subvector_dim: usize,
+    pub codebooks: Vec<Vec<Vec<f32>>>,
+}
+
+impl Default for ProductQuantizer {
+    fn default() -> Self {
+        Self {
+            m: 0,
+            ksub: 0,
+            subvector_dim: 0,
+            codebooks: Vec::new(),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Index {
-    pub tree: Tree,
-    pub hash: HashMap<u64, String>,
+    pub embeddings: Vec<VectorData>,
+    pub hash: HashMap<u64, usize>,
+    pub ids: Vec<String>,
+    pub distance: Distance,
+    pub dimension: usize,
+    #[serde(default)]
+    pub nlist: usize,
+    #[serde(default)]
+    pub nprobe: usize,
+    #[serde(default)]
+    pub coarse_centroids: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub coarse_assignments: Vec<usize>,
+    #[serde(default)]
+    pub lists: Vec<Vec<usize>>,
+    #[serde(default)]
+    pub pq: ProductQuantizer,
+    #[serde(default)]
+    pub codes: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
