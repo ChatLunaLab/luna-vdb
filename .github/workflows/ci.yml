@@ -1,8 +1,9 @@
 name: CI
 
-# Every build runs here. Nothing is compiled on a developer machine — the
-# wasm32 target, the SIMD-flag build, the browser tests and the native tests all
-# need a toolchain that is easier to pin in CI than to reproduce per laptop.
+# The reference build. Everything that ships is built and tested here — the
+# wasm32 target, the SIMD-flag build, the browser tests and the native tests
+# all need a toolchain that is easier to pin in CI than to reproduce per laptop,
+# and `release.yml` publishes only what this workflow produced.
 #
 # The same steps run on the internal build host via `scripts/remote-build.sh`,
 # for when you want a result without waiting on a runner.
@@ -12,6 +13,9 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # `release.yml` runs this whole workflow before publishing, and publishes the
+  # `pkg` artifact the package job below uploads.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -192,6 +196,24 @@ jobs:
 
       - name: Import snapshots written by the pre-rewrite engine
         run: cargo test --release --manifest-path compare/Cargo.toml
+
+  # ---------------------------------------------------------------------------
+  # Crate: what `cargo publish` would upload has to build on its own. Catches
+  # a file missing from `include` in Cargo.toml here rather than at release.
+  # ---------------------------------------------------------------------------
+  crate:
+    name: Crate package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo package --list --locked
+      - run: cargo publish --dry-run --locked
 
   # ---------------------------------------------------------------------------
   # Package: build the published artifacts and run the JS-level smoke tests

@@ -3,9 +3,28 @@ name = "luna-vdb"
 version = "1.0.0"
 authors = ["dingyi <dingyi222666@foxmail.com>"]
 edition = "2024"
-description = "Lightweight, local, WASM-first vector database"
+description = "Lightweight local vector database: IVF search with SIMD kernels, for native Rust and WebAssembly (Node.js and the browser)"
 license = "MIT"
-repository = "https://github.com/ChatLunaLab/luna-vdb.git"
+repository = "https://github.com/ChatLunaLab/luna-vdb"
+homepage = "https://github.com/ChatLunaLab/luna-vdb"
+readme = "README.md"
+keywords = ["vector-database", "embeddings", "ann", "wasm", "simd"]
+categories = ["database-implementations", "algorithms", "wasm", "science"]
+# The toolchain CI pins and tests; edition 2024 and `<[T]>::as_chunks` need
+# at least 1.88.
+rust-version = "1.90"
+# Only what a Rust user needs. The JS packaging, benchmarks against the old
+# engine, CI and charts stay in the repository.
+include = [
+    "/src/**",
+    "/benches/**",
+    "/examples/**",
+    "/tests/**/*.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
