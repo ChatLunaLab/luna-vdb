@@ -199,14 +199,20 @@ jobs:
       # package still builds without it; the release tarball below is the cheap
       # way to get it in the common case. Bump the tag deliberately: these are
       # not stable URLs, and a wrong one 404s the step.
+      #
+      # The tarball unpacks to `binaryen-<tag>/bin`, not `bin/` at the root.
+      # `$GITHUB_PATH` only affects *subsequent* steps, so the version check
+      # here has to export PATH itself — writing to `$GITHUB_PATH` and then
+      # calling `wasm-opt` in the same step fails with "command not found".
       - name: Install wasm-opt (binaryen)
         env:
           BINARYEN_VERSION: version_133
         run: |
           curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
             | tar xz -C /tmp
-          echo "/tmp/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
-          wasm-opt --version
+          BINARYEN_BIN="/tmp/binaryen-${BINARYEN_VERSION}/bin"
+          echo "$BINARYEN_BIN" >> "$GITHUB_PATH"
+          "$BINARYEN_BIN/wasm-opt" --version
 
       - name: Build both packages
         run: ./scripts/build.sh
