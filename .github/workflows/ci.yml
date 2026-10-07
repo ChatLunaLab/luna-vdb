@@ -190,9 +190,14 @@ jobs:
         with:
           node-version: 22
 
+      # `scripts/build.sh` drives both `wasm-bindgen` and `wasm-opt` directly,
+      # so this job needs the CLIs themselves — `wasm-pack` alone is not enough.
+      # The `wasm-bindgen-cli` version must match the `wasm-bindgen` crate
+      # exactly, or the generated glue is rejected at runtime; the lockfile is
+      # the source of truth for that number. Bump the two together.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack
+          tool: wasm-pack,wasm-bindgen-cli@0.2.129
 
       # `wasm-opt` comes from binaryen and is not on crates.io — `cargo install
       # wasm-opt` fails. `scripts/build.sh` treats it as optional, so the
@@ -225,6 +230,39 @@ jobs:
 
       - name: Smoke test the browser bundle (scalar fallback path)
         run: node tests/js/smoke-browser.mjs
+
+      # The opcode assertions live here rather than in the JS smoke test,
+      # because they need a real decoder.
+      #
+      # `tests/js/smoke-browser.mjs` used to scan for the `0xFD` prefix itself.
+      # That cannot distinguish an instruction from an immediate operand, and it
+      # reported 26 "SIMD opcode candidates" in a scalar artifact that contains
+      # zero vector instructions — the bytes were inside LEB128 constants and
+      # float literals. `wasm-tools print` is the correct tool.
+      #
+      # This checks the *packaged* artifact, which is what actually ships. The
+      # wasm-scalar and wasm-simd jobs check the intermediate cargo output.
+      - name: Verify packaged artifacts' SIMD content
+        run: |
+          cargo install wasm-tools --locked
+
+          for artifact in web-scalar nodejs-scalar; do
+            wasm-tools print "pkg/$artifact/luna_vdb_bg.wasm" > /tmp/scalar.wat
+            if grep -qE 'f32x4\.(add|mul|sub)' /tmp/scalar.wat; then
+              echo "::error::$artifact contains SIMD instructions; it must not"
+              exit 1
+            fi
+            echo "$artifact: clean"
+          done
+
+          for artifact in web nodejs; do
+            wasm-tools print "pkg/$artifact/luna_vdb_bg.wasm" > /tmp/simd.wat
+            if ! grep -qE 'f32x4\.(add|mul|sub)' /tmp/simd.wat; then
+              echo "::error::$artifact has no SIMD instructions; the kernel is not in use"
+              exit 1
+            fi
+            echo "$artifact: $(grep -cE 'f32x4\.(add|mul|sub)' /tmp/simd.wat) vector ops"
+          done
 
       - uses: actions/upload-artifact@v4
         with:

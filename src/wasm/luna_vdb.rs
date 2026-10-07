@@ -65,8 +65,14 @@ pub struct Neighbor {
 ///
 /// `scanned`/`rescored`/`cellsProbed` let a caller see how much work the index
 /// did — useful for choosing `nprobe` without guessing.
+///
+/// `rename_all` is load-bearing. Without it `cells_probed` goes over the wire
+/// as `cells_probed` while `LunaOptions` accepts `ivfThreshold`, so the JS
+/// surface contradicts itself and every field beyond the first word silently
+/// reads `undefined` — which is exactly what the package smoke test caught.
 #[derive(serde::Serialize, serde::Deserialize, tsify::Tsify, PartialEq, Debug, Default)]
 #[tsify(from_wasm_abi, into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchResult {
     pub neighbors: Vec<Neighbor>,
     /// Rows examined.
@@ -99,8 +105,13 @@ impl From<engine::SearchOutcome> for SearchResult {
 }
 
 /// Index statistics.
+///
+/// camelCase for the same reason as [`SearchResult`]: `pendingDeletes` and
+/// `memoryBytes` must match what `LunaOptions` and the rest of the JS-facing
+/// API use.
 #[derive(serde::Serialize, serde::Deserialize, tsify::Tsify, PartialEq, Debug)]
 #[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub size: usize,
     pub dimension: usize,
@@ -270,6 +281,7 @@ impl LunaVDB {
     }
 
     /// Exact brute-force search, ignoring the index. For measuring recall.
+    #[wasm_bindgen(js_name = searchExact)]
     pub fn search_exact(&self, query: Vec<f32>, k: usize) -> SearchResult {
         self.engine.search_exact(&query, k).into()
     }
