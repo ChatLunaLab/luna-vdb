@@ -4,7 +4,7 @@
 
 _轻量级，本地的 Wasm 向量数据库。_
 
-## [![npm](https://img.shields.io/npm/v/@chatluna/luna-vdb)](https://www.npmjs.com/package/@chatluna/luna-vdb) [![npm](https://img.shields.io/npm/dm/@chatluna/luna-vdb)](https://www.npmjs.com/package/@chatluna/luna-vdb) ![node version](https://img.shields.io/badge/node-%3E=18-green) ![github top language](https://img.shields.io/github/languages/top/ChatLunaLab/luna-vdb?logo=github)
+## [![npm](https://img.shields.io/npm/v/@chatluna/luna-vdb)](https://www.npmjs.com/package/@chatluna/luna-vdb) [![npm](https://img.shields.io/npm/dm/@chatluna/luna-vdb)](https://www.npmjs.com/package/@chatluna/luna-vdb) [![crates.io](https://img.shields.io/crates/v/luna-vdb)](https://crates.io/crates/luna-vdb) ![node version](https://img.shields.io/badge/node-%3E=18-green) ![github top language](https://img.shields.io/github/languages/top/ChatLunaLab/luna-vdb?logo=github)
 
 </div>
 
@@ -94,6 +94,35 @@ import wasmUrl from '@chatluna/luna-vdb/pkg/web/luna_vdb_bg.wasm?url'
 await init({ module_or_path: wasmUrl })
 ```
 
+### Rust
+
+引擎本身是纯 Rust 实现，不依赖 wasm，也可以作为 crate 直接使用（原生构建会用 AVX2 / NEON）：
+
+```bash
+cargo add luna-vdb
+```
+
+```rust
+use luna_vdb::engine::{self, Engine, IndexOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let data = vec![vec![0.8, 0.7, 0.6], vec![0.4, 0.3, 0.2]];
+    let ids = vec!["cat".to_string(), "dog".to_string()];
+    let mut db = Engine::build(&data, &ids, IndexOptions::default())?;
+
+    db.add("bird".to_string(), &[0.2, 0.1, 0.9])?;
+    for hit in db.search(&[0.75, 0.65, 0.55], 2).neighbors {
+        println!("{}: {}", hit.id, hit.distance);
+    }
+
+    // 与 JS 端 serialize() 的格式相同，两边可以互相读取
+    let bytes = db.serialize(true)?;
+    let restored = engine::load(&bytes)?;
+    assert_eq!(restored.len(), 3);
+    Ok(())
+}
+```
+
 ### 不支持 SIMD 的运行时
 
 默认构建使用 wasm SIMD128（Node.js 18+、Chrome 91+、Firefox 89+、Safari 16.4+ 均支持）。缺少 SIMD128 的运行时会在**实例化时**直接失败，这种情况下请改用标量构建，API 完全相同：
@@ -163,19 +192,19 @@ import { LunaVDB } from '@chatluna/luna-vdb/scalar'
 
 测试用了两种数据。均匀随机数据没有任何簇结构，是所有分区索引的最坏情况。簇状数据是互相有重叠的高斯混合分布，更接近真实的 embedding。
 
-![查询耗时：旧引擎 vs 新引擎](docs/charts/search.svg)
+![查询耗时：旧引擎 vs 新引擎](https://raw.githubusercontent.com/ChatLunaLab/luna-vdb/main/docs/charts/search.svg)
 
 - **1 万条的簇状数据上，相同召回率（1.00）下查询快 85–97 倍。**
 - **均匀数据上快 5–12 倍。** 这种数据靠索引省不下多少扫描，新引擎会自动改为精确扫描，速度来自 SIMD 和更紧凑的内存布局。
 - **5 万条时旧引擎并不比新引擎快。** 旧引擎在 2 万条以上启用的 IVF 实现有缺陷，召回率只有 0.001–0.58，返回的结果大多是错的；新引擎在这一档的召回率是 0.996–1.000。
 
-![其他操作的加速比](docs/charts/operations.svg)
+![其他操作的加速比](https://raw.githubusercontent.com/ChatLunaLab/luna-vdb/main/docs/charts/operations.svg)
 
 - **逐条写入快约 8 000 倍**：在 25 000 条、384 维的库上逐条 `add`，旧引擎每次都重建整个索引。
 - **1 万条时构建慢约 5 倍**（384 维时 31 → 166 ms）。旧引擎在这个规模不建索引；新引擎要训练 IVF 并校准 `nprobe`，上面的查询速度就是这样换来的。
 - 快照体积比旧格式大约 10%。
 
-![近似搜索的召回率与速度](docs/charts/recall.svg)
+![近似搜索的召回率与速度](https://raw.githubusercontent.com/ChatLunaLab/luna-vdb/main/docs/charts/recall.svg)
 
 这张图把新引擎的近似搜索与它自己的精确扫描作对比：每条曲线逐个调大 `nprobe`，★ 是自动校准选出的默认值。在簇状数据上，校准结果都是 2 个簇，比精确扫描快 7.5–34 倍，召回率 0.966–1.000；开启 PQ（`exactRescoreOnly: false`）后快 6–78 倍。在均匀数据上，想达到召回率目标就得扫描大部分数据，所以校准结果是探测全部簇，也就是精确搜索；PQ 在这种数据上达不到目标，会被自动停用。
 
@@ -196,6 +225,21 @@ yarn bench          # 原生基准测试
 ```
 
 构建需要 Rust 1.90、`wasm32-unknown-unknown` target 和 `wasm-bindgen-cli`（版本必须与 `Cargo.lock` 中的 `wasm-bindgen` 完全一致，目前是 0.2.129）；`wasm-opt`（binaryen）可选。`yarn remote:test`、`yarn remote:wasm` 等脚本会把代码同步到远程主机，在 Docker 中构建和测试。
+
+### 发布
+
+发布由 CI 完成。先把 `Cargo.toml` 和 `package.json` 的版本号改成同一个值，合并到 `main`，再推送对应的 tag：
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+[`release.yml`](.github/workflows/release.yml) 会先跑完整的 CI，然后：
+
+- 把 CI 构建并测试过的 `pkg/` 以 staged publishing 的方式提交到 npm（OIDC 可信发布，不需要 token）。版本不会立即上线，需要维护者在 npmjs.com 的 **Staged Packages** 页面用 2FA 批准。
+- 用 `crates-io` environment 里的 `CARGO_REGISTRY_TOKEN` 发布到 crates.io。
+
+已经发布过的版本会被跳过，所以任意一边失败后可以单独重跑。
 
 ## 致谢
 
