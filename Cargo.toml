@@ -63,7 +63,22 @@ debug = true
 strip = false
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O4", "--enable-simd", "--enable-bulk-memory"]
+# Must stay in step with `COMMON_FEATURES` in `scripts/build.sh`. The
+# `--enable-*` flags are validation flags: they widen what wasm-opt will accept,
+# and binaryen's default set is narrower than what rustc emits for
+# `wasm32-unknown-unknown`. `--enable-nontrapping-float-to-int` covers
+# `i32.trunc_sat_f32_u`, which every float-to-integer `as` cast lowers to;
+# without it wasm-opt fails with "all used features should be allowed".
+wasm-opt = [
+    "-O4",
+    "--enable-simd",
+    "--enable-bulk-memory",
+    "--enable-nontrapping-float-to-int",
+    "--enable-reference-types",
+    "--enable-multivalue",
+    "--enable-sign-ext",
+    "--enable-mutable-globals",
+]
 
 [package.metadata.wasm-pack]
 skip-pkg-json = true
