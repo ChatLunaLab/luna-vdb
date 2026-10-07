@@ -1,0 +1,41 @@
+[package]
+name = "luna-vdb-legacy-compare"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Head-to-head benchmark: the rewritten engine against the last pre-rewrite commit"
+
+# Not part of the main package. It pulls in the *old* luna-vdb as a second,
+# renamed dependency so both engines run in one process on identical data,
+# which is the only way the speedup figure means anything.
+#
+# Run in CI (the `compare` job), never locally:
+#   cargo run --release --manifest-path compare/Cargo.toml --bin luna-vdb-legacy-compare
+#   cargo run --release --manifest-path compare/Cargo.toml --bin sweep
+
+# Explicit targets: the repository's `.gitignore` excludes every `bin/`
+# directory, so the conventional `src/bin/sweep.rs` would silently never be
+# committed.
+[[bin]]
+name = "luna-vdb-legacy-compare"
+path = "src/main.rs"
+
+[[bin]]
+name = "sweep"
+path = "src/sweep.rs"
+
+[dependencies]
+luna-vdb = { path = "..", default-features = false }
+
+# The last commit before the rewrite. Pinned by full hash so the baseline never
+# drifts. Its own release profile was `opt-level = "s"`; dependency profiles
+# are set by *this* crate, so the old engine is measured at `opt-level = 3`
+# here — a stronger baseline than what actually shipped, which can only make
+# the reported speedup smaller, not larger.
+legacy = { package = "luna-vdb", git = "https://github.com/ChatLunaLab/luna-vdb", rev = "ca10590c7befbc789889112e7791e95ce2bf4392" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

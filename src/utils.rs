@@ -1,10 +1,11 @@
+/// Install the panic hook once. Called from `LunaVDB::new` so that if we ever
+/// do hit an internal invariant, the browser/devtools console shows the Rust
+/// message instead of a bare `unreachable executed`.
 pub fn set_panic_hook() {
-    // When the `console_error_panic_hook` feature is enabled, we can call the
-    // `set_panic_hook` function at least once during initialization, and then
-    // we will get better error messages if our code ever panics.
-    //
-    // For more details see
-    // https://github.com/rustwasm/console_error_panic_hook#readme
-    #[cfg(feature = "console_error_panic_hook")]
-    console_error_panic_hook::set_once();
+    #[cfg(all(feature = "console_error_panic_hook", target_arch = "wasm32"))]
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(console_error_panic_hook::set_once);
+    }
 }

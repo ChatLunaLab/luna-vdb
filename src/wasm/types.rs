@@ -1,31 +1,11 @@
-use serde::{Deserialize, Serialize};
-use tsify::Tsify;
+//! Re-exports for the wasm surface.
+//!
+//! The transfer types live next to the bindings that use them
+//! ([`crate::wasm::luna_vdb`]); this module only re-exports what the crate root
+//! and the JS typings need, so `tsify` sees one definition per type.
 
+/// A `k`-nearest-neighbour count.
 pub type TopK = usize;
+
+/// Serialised index bytes, as produced by `serialize()`.
 pub type SerializedIndex = Vec<u8>;
-
-#[derive(Serialize, Deserialize, Debug, Clone, Tsify, PartialEq)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-pub struct SearchResult {
-    pub neighbors: Vec<Neighbor>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Tsify, PartialEq)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-pub struct Neighbor {
-    pub id: String,
-    pub distance: f32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Tsify)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-pub struct EmbeddedResource {
-    pub id: String,
-    pub embeddings: Vec<f32>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Tsify)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
-pub struct Resource {
-    pub embeddings: Vec<EmbeddedResource>,
-}
