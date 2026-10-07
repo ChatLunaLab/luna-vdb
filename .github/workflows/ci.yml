@@ -287,9 +287,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run benchmark
-        run: cargo bench --bench search 2>&1 | tee bench.txt
+        run: |
+          set -o pipefail
+          cargo bench --bench search 2>&1 | tee bench.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: bench-results
           path: bench.txt
+
+  # ---------------------------------------------------------------------------
+  # Compare: the rewritten engine against the last pre-rewrite commit, in one
+  # process on identical data. This is the number behind any "N× faster" claim.
+  # Informational, not a gate — the runner is shared hardware.
+  # ---------------------------------------------------------------------------
+  compare:
+    name: Compare with pre-rewrite engine
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compare
+
+      - name: Run comparison
+        # `pipefail`: the default runner shell is `bash -e` without it, so a
+        # failed build piped through `tee` would otherwise report success.
+        run: |
+          set -o pipefail
+          cargo run --release --manifest-path compare/Cargo.toml 2>&1 | tee compare.txt
+
+      - name: Publish to the job summary
+        if: always()
+        run: |
+          {
+            echo '## Rewritten engine vs pre-rewrite (ca10590)'
+            echo '```'
+            cat compare.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compare-results
+          path: compare.txt
