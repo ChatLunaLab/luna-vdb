@@ -64,6 +64,7 @@
         "default": "./pkg/nodejs-scalar/luna_vdb.js"
       }
     },
+    "./pkg/*": "./pkg/*",
     "./package.json": "./package.json"
   },
   "scripts": {

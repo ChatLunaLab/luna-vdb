@@ -80,6 +80,12 @@ test('constructs with options', () => {
   assert.equal(db.distance(), 'cosine')
 })
 
+test('0.0.x constructor form still indexes its vectors', () => {
+  const db = new LunaVDB({ embeddings: [{ id: 'a', embeddings: [1, 0] }, { id: 'b', embeddings: [0, 1] }] })
+  assert.equal(db.size(), 2)
+  assert.equal(db.search([0, 1], 1).neighbors[0].id, 'b')
+})
+
 test('rejects an unknown distance', () => {
   assert.throws(() => new LunaVDB({ distance: 'hamming' }), /unknown distance/)
 })

@@ -279,6 +279,13 @@ fn header_from_js(value: &JsValue) -> Vec<u8> {
     view.subarray(0, engine::codec::HEADER_LEN as u32).to_vec()
 }
 
+/// `true` for an object carrying an `embeddings` key — a [`Resource`], which
+/// no [`LunaOptions`] has.
+fn is_resource(value: &JsValue) -> bool {
+    value.is_object()
+        && js_sys::Reflect::has(value, &JsValue::from_str("embeddings")).unwrap_or(false)
+}
+
 fn check_query(query: &[f32]) -> Result<(), JsValue> {
     match query.iter().position(|value| !value.is_finite()) {
         Some(index) => Err(type_error(&format!(
@@ -304,17 +311,33 @@ pub struct LunaVDB {
 
 #[wasm_bindgen]
 impl LunaVDB {
-    /// Create an empty database.
+    /// Create a database.
     ///
     /// ```js
     /// const db = new LunaVDB();
     /// const db = new LunaVDB({ distance: "cosine" });
+    /// const db = new LunaVDB({ embeddings: [{ id: "a", embeddings: [1, 0] }] });
     /// ```
+    ///
+    /// The last form is the 0.0.x constructor, which took the initial vectors
+    /// rather than options; it builds with default options, like `index()`.
     #[wasm_bindgen(constructor)]
     pub fn new(
-        #[wasm_bindgen(unchecked_optional_param_type = "LunaOptions")] options: JsValue,
+        #[wasm_bindgen(unchecked_optional_param_type = "LunaOptions | Resource")] options: JsValue,
     ) -> Result<LunaVDB, JsValue> {
         set_panic_hook();
+
+        // Without this branch a 0.0.x `new LunaVDB({ embeddings })` would
+        // decode as options with nothing set and silently yield an empty
+        // database.
+        if is_resource(&options) {
+            let mut db = LunaVDB {
+                engine: Engine::new(IndexOptions::default()),
+                options: IndexOptions::default(),
+            };
+            db.index(options)?;
+            return Ok(db);
+        }
 
         let options = decode_options(options)?;
         Ok(LunaVDB {

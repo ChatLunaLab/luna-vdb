@@ -2,7 +2,7 @@
 #
 # Build the published wasm packages.
 #
-# Produces two targets, both written under `pkg/`:
+# Produces four packages, all written under `pkg/`:
 #
 #   pkg/web      — `--target web`,      ESM,         SIMD128
 #   pkg/nodejs   — `--target nodejs`,   CJS,         SIMD128
@@ -104,16 +104,14 @@ RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+simd128" \
 
 cp "$ARTIFACT" pkg/luna_vdb_simd.wasm
 
+# No `--omit-default-module-path` on the web targets. The default path is
+# `new URL('luna_vdb_bg.wasm', import.meta.url)`, which is what lets a bare
+# `await init()` work — and the pattern Vite and webpack 5 recognise to emit
+# the .wasm as an asset. Omitting it makes `init()` without arguments throw,
+# which is how 0.0.x browser users call it.
 for out in web nodejs; do
-  # `--target web` gets `--omit-default-module-path`: it makes the generated
-  # loader avoid a hard-coded path so Vite/webpack can resolve the .wasm through
-  # their own asset pipeline. `--target nodejs` must NOT get it — that target
-  # emits a `require('./luna_vdb_bg.wasm')` and relies on the default path.
-  extra=""
-  [ "$out" = web ] && extra="--omit-default-module-path"
-
   echo "==> wasm-bindgen --target $out (simd)"
-  wasm-bindgen "$ARTIFACT" --out-dir "pkg/$out" --target "$out" $extra
+  wasm-bindgen "$ARTIFACT" --out-dir "pkg/$out" --target "$out"
   optimise "pkg/$out/luna_vdb_bg.wasm" --enable-simd
 done
 
@@ -132,11 +130,9 @@ cp "$ARTIFACT" pkg/luna_vdb_scalar.wasm
 
 for out in web-scalar nodejs-scalar; do
   base="${out%-scalar}"
-  extra=""
-  [ "$base" = web ] && extra="--omit-default-module-path"
 
   echo "==> wasm-bindgen --target $base (scalar) -> pkg/$out"
-  wasm-bindgen "$ARTIFACT" --out-dir "pkg/$out" --target "$base" $extra
+  wasm-bindgen "$ARTIFACT" --out-dir "pkg/$out" --target "$base"
   optimise "pkg/$out/luna_vdb_bg.wasm"
 done
 

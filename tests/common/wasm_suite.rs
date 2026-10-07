@@ -166,6 +166,43 @@ pub fn test_invalid_option_does_not_poison() {
     assert_eq!(engine.size(), 0);
 }
 
+/// 0.0.x took the initial vectors in the constructor. That call must still
+/// build them, not decode as empty options and drop them.
+#[wasm_bindgen_test]
+pub fn test_new_with_a_resource_indexes_it() {
+    let engine = LunaVDB::new(resource(vec![
+        EmbeddedResource {
+            id: "a".to_string(),
+            embeddings: vec![1.0, 0.0],
+        },
+        EmbeddedResource {
+            id: "b".to_string(),
+            embeddings: vec![0.0, 1.0],
+        },
+    ]))
+    .expect("construct");
+
+    assert_eq!(engine.size(), 2);
+    assert_eq!(engine.distance(), "euclidean");
+    let hits = engine.search(vec![0.0, 1.0], 1).expect("search");
+    assert_eq!(ids_of(&hits), vec!["b"]);
+
+    // A bad batch throws, like `index()`.
+    assert!(
+        LunaVDB::new(resource(vec![
+            EmbeddedResource {
+                id: "a".to_string(),
+                embeddings: vec![1.0],
+            },
+            EmbeddedResource {
+                id: "a".to_string(),
+                embeddings: vec![2.0],
+            },
+        ]))
+        .is_err()
+    );
+}
+
 #[wasm_bindgen_test]
 pub fn test_index_and_size() {
     let mut engine = new_db();

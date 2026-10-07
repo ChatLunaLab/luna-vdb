@@ -105,6 +105,21 @@ await test('scalar module is loadable through its ESM entry point', async () => 
   assert.equal(db.size(), 0)
 })
 
+// `init()` with no argument resolves the .wasm next to the glue via
+// `import.meta.url`. Node's fetch cannot load file: URLs, so this checks the
+// glue rather than calling it; a build with `--omit-default-module-path`
+// would make every argument-less `init()` in a browser throw.
+await test('web glue falls back to the bundled .wasm when init() gets no path', async () => {
+  for (const dir of ['web', 'web-scalar']) {
+    const glue = await readFile(path.join(pkgRoot, dir, 'luna_vdb.js'), 'utf8')
+    assert.match(
+      glue,
+      /new URL\(['"]luna_vdb_bg\.wasm['"], import\.meta\.url\)/,
+      `pkg/${dir} has no default module path`,
+    )
+  }
+})
+
 await test('simd module validates and loads through its ESM entry point', async () => {
   const wasmPath = path.join(pkgRoot, 'web', 'luna_vdb_bg.wasm')
   const bytes = await readFile(wasmPath)
