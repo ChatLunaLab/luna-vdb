@@ -39,7 +39,7 @@ console_error_panic_hook = ["dep:console_error_panic_hook"]
 wasm-bindgen = "0.2.104"
 serde = { version = "1.0.217", features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
-tsify = { version = "0.4.5", features = ["js"] }
+tsify = { version = "0.5.8", features = ["js"] }
 bytemuck = { version = "1.21", features = ["derive"] }
 # Only used to read snapshots written by luna-vdb <= 0.0.12 (gzip + bincode v1).
 flate2 = "1.0.35"
