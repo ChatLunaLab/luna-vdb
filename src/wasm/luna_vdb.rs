@@ -77,8 +77,9 @@ pub struct Neighbor {
 /// Search results plus diagnostics.
 ///
 /// `scanned`/`rescored`/`cellsProbed` let a caller see how much work the index
-/// did. `exact` is `true` unless the handle was built with
-/// `approximate: true`.
+/// did. `exact` is `false` for an approximate answer — the default once the
+/// index exists — and `true` for `searchExact`, for `approximate: false`, and
+/// whenever the approximate search fell back to the exact one.
 ///
 /// `rename_all` is load-bearing. Without it `cells_probed` goes over the wire
 /// as `cells_probed` while `LunaOptions` accepts `ivfThreshold`, so the JS
@@ -158,7 +159,8 @@ pub struct LunaOptions {
     pub distance: Option<String>,
     /// Coarse cells. `null` picks `sqrt(size)`.
     pub nlist: Option<usize>,
-    /// Cells probed per query in approximate mode.
+    /// Cells probed per query in approximate mode. `null` calibrates it at
+    /// build time for recall@10 of 0.95.
     pub nprobe: Option<usize>,
     /// PQ subquantisers.
     pub pq_m: Option<usize>,
@@ -167,11 +169,12 @@ pub struct LunaOptions {
     /// Corpus size at which the IVF index is built. Default 4096.
     pub ivf_threshold: Option<usize>,
     /// `true` (default) skips product quantisation. Set `false` to train a PQ
-    /// prefilter; it is used only when `approximate` is also `true`.
+    /// prefilter; it is used only in approximate mode, and dropped when it
+    /// cannot reach the recall target.
     pub exact_rescore_only: Option<bool>,
-    /// `false` (default): every search returns the exact nearest neighbours.
-    /// `true`: probe a fixed `nprobe` cells instead — faster on data with
-    /// little cluster structure, at the cost of recall.
+    /// `true` (default): probe the `nprobe` most promising cells, calibrated
+    /// so recall@10 stays at or above about 0.95 against the exact answer.
+    /// `false`: every search returns the exact nearest neighbours.
     pub approximate: Option<bool>,
 }
 
@@ -402,8 +405,8 @@ impl LunaVDB {
         Ok(self.engine.search(&query, k).into())
     }
 
-    /// Brute-force search, ignoring the index. For measuring recall of the
-    /// approximate mode; the default `search` already returns this answer.
+    /// Brute-force search, ignoring the index: the exact answer, for when
+    /// recall must be 1 or for measuring what the default `search` returns.
     #[wasm_bindgen(js_name = searchExact)]
     pub fn search_exact(&self, query: Vec<f32>, k: usize) -> Result<SearchResult, JsValue> {
         check_query(&query)?;

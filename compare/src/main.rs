@@ -242,7 +242,7 @@ fn main() {
             Ok(engine) => {
                 engine.len() == size
                     && queries.iter().take(10).all(|q| {
-                        engine.search(q, K).neighbors == new_db.search_exact(q, K).neighbors
+                        engine.search_exact(q, K).neighbors == new_db.search_exact(q, K).neighbors
                     })
             }
             Err(_) => false,

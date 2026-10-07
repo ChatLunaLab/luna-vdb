@@ -339,12 +339,18 @@ pub fn test_search_empty_engine() {
 }
 
 #[wasm_bindgen_test]
-pub fn test_default_search_is_exact() {
-    let mut engine = LunaVDB::new(fast_options()).expect("construct");
+pub fn test_exact_mode_is_exact() {
+    let mut engine = LunaVDB::new(options(LunaOptions {
+        ivf_threshold: Some(256),
+        approximate: Some(false),
+        ..Default::default()
+    }))
+    .expect("construct");
     engine
         .index(resource(generate_test_data(2000, 32, 0xABC)))
         .expect("index");
     assert!(engine.stats().indexed);
+    assert!(!engine.stats().approximate);
 
     let mut next = rng(0xD1CE);
     for _ in 0..10 {
@@ -356,11 +362,32 @@ pub fn test_default_search_is_exact() {
     }
 }
 
+/// The default is approximate, at a recall the index calibrates for: at
+/// least 0.9 against the brute-force answer even on unstructured data.
+#[wasm_bindgen_test]
+pub fn test_default_search_keeps_recall() {
+    let mut engine = LunaVDB::new(fast_options()).expect("construct");
+    engine
+        .index(resource(generate_test_data(3000, 32, 0xABC)))
+        .expect("index");
+    assert!(engine.stats().approximate);
+
+    let mut next = rng(0xD1CE);
+    let mut hits = 0usize;
+    for _ in 0..20 {
+        let query: Vec<f32> = (0..32).map(|_| next()).collect();
+        let fast = ids_of(&engine.search(query.clone(), 10).expect("search"));
+        let slow = ids_of(&engine.search_exact(query, 10).expect("search"));
+        hits += fast.iter().filter(|id| slow.contains(id)).count();
+    }
+    let recall = hits as f32 / 200.0;
+    assert!(recall >= 0.9, "recall was {recall}");
+}
+
 #[wasm_bindgen_test]
 pub fn test_approximate_mode_reports_itself() {
     let mut engine = LunaVDB::new(options(LunaOptions {
         ivf_threshold: Some(256),
-        approximate: Some(true),
         nprobe: Some(2),
         ..Default::default()
     }))
@@ -878,7 +905,7 @@ pub fn test_stats() {
     assert_eq!(stats.dimension, 16);
     assert_eq!(stats.distance, "euclidean");
     assert!(stats.indexed);
-    assert!(!stats.approximate);
+    assert!(stats.approximate);
     assert!(stats.nlist > 0);
     assert!(stats.nprobe > 0);
     assert!(stats.memory_bytes > 0);

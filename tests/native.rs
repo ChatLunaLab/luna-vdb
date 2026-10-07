@@ -647,13 +647,11 @@ fn approximate_search_does_less_work_than_exact() {
     assert_eq!(exact.candidates_scored, 3000);
 }
 
-#[test]
-fn default_search_is_exact_and_prunes_on_clustered_data() {
-    // 40 well-separated blobs. The exact search must return exactly the
-    // brute-force answer while touching only a fraction of the rows.
+/// 40 well-separated blobs of 32-d points.
+fn blobs(count: usize) -> Vec<Vec<f32>> {
     let centres = corpus(40, 32, 0xCE17);
-    let noise = corpus(6000, 32, 0x2015E);
-    let data: Vec<Vec<f32>> = noise
+    let noise = corpus(count, 32, 0x2015E);
+    noise
         .iter()
         .enumerate()
         .map(|(i, n)| {
@@ -663,8 +661,39 @@ fn default_search_is_exact_and_prunes_on_clustered_data() {
                 .map(|(c, e)| c * 4.0 + 0.1 * e)
                 .collect()
         })
-        .collect();
-    let engine = build(&data, &ids_of(6000, "v"), fast());
+        .collect()
+}
+
+#[test]
+fn default_search_is_approximate_fast_and_accurate_on_clustered_data() {
+    let data = blobs(6064);
+    let (data, queries) = data.split_at(6000);
+    let engine = build(data, &ids_of(6000, "v"), fast());
+
+    let outcome = engine.search(&queries[0], 10);
+    assert!(!outcome.exact, "the default search is approximate");
+    assert!(
+        outcome.candidates_scored < 6000 / 10,
+        "scanned {} of 6000 rows",
+        outcome.candidates_scored
+    );
+    let measured = recall(&engine, queries, 10);
+    assert!(measured >= 0.9, "recall was {measured}");
+}
+
+#[test]
+fn exact_mode_is_exact_and_prunes_on_clustered_data() {
+    // The exact search must return exactly the brute-force answer while
+    // touching only a fraction of the rows.
+    let data = blobs(6000);
+    let engine = build(
+        &data,
+        &ids_of(6000, "v"),
+        IndexOptions {
+            approximate: false,
+            ..fast()
+        },
+    );
 
     let mut scanned = 0usize;
     for row in (0..6000).step_by(250) {
@@ -785,12 +814,29 @@ fn pq_index_recall_is_acceptable() {
 }
 
 #[test]
-fn default_recall_is_perfect() {
-    // No approximation by default: recall against the brute-force answer is
-    // exactly 1 on unstructured data too, where probing a fraction of the
-    // cells used to find a fraction of the neighbours.
+fn default_recall_holds_on_unstructured_data() {
+    // Uniform noise is the worst case for a partitioning index: the
+    // neighbours of a query are spread over many cells. Calibration has to
+    // notice and probe enough of them, where a fixed fraction used to find a
+    // fraction of the neighbours.
     let data = corpus(5000, 48, 0xF1A7);
     let engine = build(&data, &ids_of(5000, "v"), fast());
+    let queries = corpus(30, 48, 0x0E);
+    let measured = recall(&engine, &queries, 10);
+    assert!(measured >= 0.9, "recall was {measured}");
+}
+
+#[test]
+fn exact_mode_recall_is_perfect() {
+    let data = corpus(5000, 48, 0xF1A7);
+    let engine = build(
+        &data,
+        &ids_of(5000, "v"),
+        IndexOptions {
+            approximate: false,
+            ..fast()
+        },
+    );
     let queries = corpus(30, 48, 0x0E);
     assert_eq!(recall(&engine, &queries, 10), 1.0);
 }

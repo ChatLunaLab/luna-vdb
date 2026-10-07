@@ -3,18 +3,20 @@
 //! For each dataset and size it prints:
 //!
 //! * the brute-force scan (the reference, recall 1.0 by definition),
-//! * the default search — exact, IVF-pruned — with how many rows it scanned,
+//! * the default search — approximate, with the `nprobe` the index calibrated
+//!   for itself — and the exact IVF-pruned search (`approximate: false`),
 //! * approximate mode across `nprobe`, with exact scoring of every probed row
 //!   ("ivf-flat") and with the PQ prefilter ("ivf-pq").
 //!
 //! Two datasets, because the answer depends on them: uniform random vectors
 //! have no neighbourhood structure for any partitioning index to exploit, so
-//! the pruned search scans most rows and the approximate one has low recall;
-//! an overlapping Gaussian mixture is much closer to real text embeddings.
+//! the pruned search scans most rows and a fixed small `nprobe` has low
+//! recall; an overlapping Gaussian mixture is much closer to real text
+//! embeddings.
 //!
 //! The `cells` column is the number of cells actually probed, averaged over
-//! the queries — the effective probe count, which can exceed the requested
-//! `nprobe` because the engine probes at least `k / 4` cells.
+//! the queries. The default row is measured on fresh queries, while the
+//! calibration used stored rows, so its recall checks the calibration too.
 
 use std::collections::HashSet;
 use std::hint::black_box;
@@ -222,17 +224,17 @@ fn main() {
                 flat.recall
             );
 
-            let pruned = measure(&queries, &truth, |q| engine.search(q, K));
-            println!(
-                "   default (exact, pruned)  {:>9.4} ms   recall {:.3}   {:>6.1}x vs scan   scanned {:>8.0} rows in {:>5.1} cells   build {:.0} ms, nlist {}",
-                ms(pruned.latency),
-                pruned.recall,
-                flat.latency.as_secs_f64() / pruned.latency.as_secs_f64().max(1e-12),
-                pruned.scanned,
-                pruned.cells,
-                ms(build),
-                engine.nlist(),
+            let default = measure(&queries, &truth, |q| engine.search(q, K));
+            print_row(
+                &format!("default (nprobe {:>3})", engine.nprobe()),
+                &default,
+                flat.latency,
             );
+            println!("   build {:.0} ms, nlist {}", ms(build), engine.nlist());
+
+            engine.set_approximate(false);
+            let pruned = measure(&queries, &truth, |q| engine.search(q, K));
+            print_row("exact (pruned)      ", &pruned, flat.latency);
 
             engine.set_approximate(true);
             sweep("ivf-flat", &mut engine, &queries, &truth, flat.latency);
@@ -254,13 +256,30 @@ fn main() {
                 }
             };
             println!(
-                "   ivf-pq build {:.0} ms, pq {}",
+                "   ivf-pq build {:.0} ms, pq {} (calibration drops it when it cannot reach the recall target)",
                 ms(started.elapsed()),
                 pq.has_pq()
+            );
+            let pq_default = measure(&queries, &truth, |q| pq.search(q, K));
+            print_row(
+                &format!("pq default (nprobe {:>3})", pq.nprobe()),
+                &pq_default,
+                flat.latency,
             );
             sweep("ivf-pq  ", &mut pq, &queries, &truth, flat.latency);
         }
     }
+}
+
+fn print_row(label: &str, m: &Measured, reference: Duration) {
+    println!(
+        "   {label} {:>9.4} ms   recall {:.3}   {:>6.1}x vs scan   scanned {:>8.0} rows in {:>5.1} cells",
+        ms(m.latency),
+        m.recall,
+        reference.as_secs_f64() / m.latency.as_secs_f64().max(1e-12),
+        m.scanned,
+        m.cells,
+    );
 }
 
 fn sweep(
@@ -277,8 +296,7 @@ fn sweep(
         }
         engine.set_nprobe(nprobe);
         let m = measure(queries, truth, |q| engine.search(q, K));
-        // Requests below the engine's `k / 4` floor probe the same cells;
-        // print each effective configuration once.
+        // Print each effective configuration once.
         let effective = m.cells.round() as usize;
         if effective == last {
             continue;

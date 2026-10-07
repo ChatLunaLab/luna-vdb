@@ -1,29 +1,38 @@
-//! The vector index: an IVF partition over a flat arena, searched **exactly**
-//! by default, with an opt-in approximate mode.
+//! The vector index: an IVF partition over a flat arena. Searched
+//! approximately by default, at a recall target the index calibrates for
+//! itself, or exactly on request.
 //!
-//! # Exact by default
+//! # Approximate by default, at a measured recall
 //!
-//! The default search returns the same neighbours as a brute-force scan. The
-//! IVF cells are used for *pruning*, not for guessing: every cell records the
-//! largest distance from its centroid to any row filed in it (its radius), and
-//! by the triangle inequality no row in a cell can be closer to the query than
-//! `d(query, centroid) - radius`. Cells are visited in order of that lower
-//! bound, and the scan stops at the first cell whose bound is worse than the
-//! current k-th best — every cell after it is provably worse too. Dot product
-//! uses the Cauchy–Schwarz form of the same bound,
-//! `q·x <= q·c + |q|·radius`.
+//! The default search probes the `nprobe` cells whose centroids rank closest
+//! to the query and scores every live row in them exactly. Fewer cells is
+//! faster and finds fewer of the true neighbours, so `nprobe` is not a fixed
+//! fraction: after every training run the index measures it. Stored rows serve
+//! as leave-one-out queries, their exact neighbours are found, and `nprobe` is
+//! set to the fewest cells that recover 95% of those neighbours
+//! (`TARGET_RECALL`, `Engine::calibrate_nprobe`). On clustered data — real embeddings —
+//! that is a handful of cells; on data with no structure at all it is most of
+//! them, and the search is barely faster than a scan, but it does not quietly
+//! return the wrong rows. (The pre-1.0 engine probed a fixed fraction and
+//! measured 0.000–0.005 recall@10 on such data.) An explicit `nprobe` turns the
+//! calibration off.
 //!
-//! So the speed of a search depends on the data, and its correctness does not.
-//! On clustered data (real embeddings) most cells are pruned; on data with no
-//! structure at all — uniform noise in hundreds of dimensions — the bounds are
-//! loose and the scan degrades towards a full pass, which is still the
-//! vectorised one and still exact. The earlier design probed a fixed fraction
-//! of cells and measured 2–10% recall@10 on unstructured data at its defaults;
-//! a "speedup" bought that way is not one.
+//! # Exact on request
 //!
-//! `IndexOptions::approximate` restores fixed-`nprobe` probing, optionally with
-//! a PQ prefilter, for callers who want to trade recall for latency
-//! explicitly. `SearchOutcome::exact` says which kind of answer came back.
+//! With `approximate: false` the search returns the same neighbours as a
+//! brute-force scan. The IVF cells are then used for *pruning*, not for
+//! guessing: every cell records the largest distance from its centroid to any
+//! row filed in it (its radius), and by the triangle inequality no row in a
+//! cell can be closer to the query than `d(query, centroid) - radius`. Cells
+//! are visited in order of that lower bound, and the scan stops at the first
+//! cell whose bound is worse than the current k-th best — every cell after it
+//! is provably worse too. Dot product uses the Cauchy–Schwarz form of the same
+//! bound, `q·x <= q·c + |q|·radius`. The bounds are loose in high dimensions,
+//! so this is typically 1–2x faster than a flat scan rather than 10x.
+//!
+//! The approximate search falls back to the exact one whenever the probe would
+//! cover every cell anyway, or the probed cells hold fewer than `k` rows.
+//! `SearchOutcome::exact` says which kind of answer came back.
 //!
 //! # What changed from the pre-1.0 engine
 //!
@@ -63,10 +72,32 @@ use crate::engine::types::{Distance, Embedding, EngineError, EngineResult, Vecto
 /// indexing early is the k-means run at build time.
 pub const DEFAULT_IVF_THRESHOLD: usize = 4_096;
 
-/// Approximate mode only: cells probed by default, as a fraction of `nlist`.
+/// Recall@[`CALIBRATION_K`] the automatic `nprobe` is chosen to reach on the
+/// calibration queries. Above the 0.9 callers asked for, because the estimate
+/// comes from queries drawn from the corpus itself; real queries can sit
+/// further from the stored vectors than that.
+const TARGET_RECALL: f32 = 0.95;
+
+/// Neighbours per calibration query — the `k` the calibrated `nprobe` is for.
+/// See [`Engine::effective_nprobe`] for larger `k`.
+const CALIBRATION_K: usize = 10;
+
+/// Stored rows used as calibration queries. Each costs one exact search per
+/// training run; 32 queries of 10 neighbours put the standard error of the
+/// recall estimate around 0.01–0.02.
+const CALIBRATION_QUERIES: usize = 32;
+
+/// Calibration never picks fewer cells than this. The calibration queries are
+/// stored rows, which sit inside the clusters; a real query can land between
+/// two, where a single cell holds only part of its neighbourhood. On clustered
+/// data one cell often reaches the target alone, and the second costs a few
+/// hundredths of a millisecond.
+const MIN_CALIBRATED_NPROBE: usize = 2;
+
+/// Fallback `nprobe` when nothing was calibrated, as a fraction of `nlist`.
 const DEFAULT_NPROBE_RATIO: f32 = 0.05;
 
-/// Approximate mode only: never probe fewer cells than this by default.
+/// Fallback `nprobe` floor.
 const MIN_DEFAULT_NPROBE: usize = 8;
 
 /// Approximate mode with PQ: candidates to rescore per requested neighbour.
@@ -129,8 +160,9 @@ pub struct IndexOptions {
     pub distance: Distance,
     /// Coarse cells. `None` picks `round(sqrt(n))`.
     pub nlist: Option<usize>,
-    /// Approximate mode only: cells probed per query. `None` picks ~5% of
-    /// `nlist`, at least 8.
+    /// Approximate mode only: cells probed per query, for `k` up to 10. `None`
+    /// calibrates it after each training run to reach recall@10 of 0.95;
+    /// see the module docs.
     pub nprobe: Option<usize>,
     /// PQ subquantisers. `None` derives one byte per 8 dimensions, rounded so
     /// `dim % m == 0`.
@@ -145,10 +177,11 @@ pub struct IndexOptions {
     pub compact_ratio: f32,
     /// `false` trains PQ codes and uses them as a prefilter in approximate
     /// mode. The default, `true`, skips PQ entirely: no codebook training at
-    /// build time, and every probed row is scored exactly.
+    /// build time, and every probed row is scored exactly. PQ is dropped again
+    /// when calibration finds it cannot reach the recall target.
     pub exact_rescore_only: bool,
-    /// Probe a fixed `nprobe` cells instead of searching exactly. Faster on
-    /// data with little cluster structure, at the cost of recall; see the
+    /// `true` (default): probe the calibrated `nprobe` cells. `false`: return
+    /// the exact nearest neighbours, using the cells only to prune. See the
     /// module docs.
     pub approximate: bool,
     /// Seed for k-means, so a snapshot is reproducible.
@@ -167,7 +200,7 @@ impl Default for IndexOptions {
             retrain_growth_ratio: RETRAIN_GROWTH_RATIO,
             compact_ratio: DEFAULT_COMPACT_RATIO,
             exact_rescore_only: true,
-            approximate: false,
+            approximate: true,
             seed: 0x5EED_5EED_5EED_5EED,
         }
     }
@@ -299,10 +332,9 @@ impl Pq {
 
     /// Squared L2 from `residual` to every centroid of every subquantiser.
     ///
-    /// `m × ksub` floats, laid out per subquantiser. Computed **once per query**
-    /// rather than once per probed cell — that is the fix for the old
-    /// `distance_tables` call, which sat inside the per-cell loop and so
-    /// recomputed identical tables `nprobe` times.
+    /// `m × ksub` floats, laid out per subquantiser. Codes encode the residual
+    /// against a row's own cell, so the tables are built once per probed cell,
+    /// from the query's residual against that cell's centroid.
     fn distance_tables(&self, residual: &[f32]) -> Vec<f32> {
         let mut tables = vec![0.0f32; self.m * self.ksub];
 
@@ -523,7 +555,13 @@ impl Engine {
                 Some(pq) => {
                     engine.install_pq(pq, snapshot.codes, count)?;
                 }
-                None => engine.train_pq(),
+                None => {
+                    engine.train_pq();
+                    // The stored `nprobe` was calibrated without a prefilter.
+                    if engine.has_pq() && options.nprobe.is_none() {
+                        engine.nprobe = engine.calibrate_nprobe();
+                    }
+                }
             }
         } else {
             // No index in the snapshot (a legacy import, or a corpus that was
@@ -631,9 +669,9 @@ impl Engine {
     /// `nprobe` is purely a search-time knob — the cells and their contents do
     /// not depend on it — so retuning recall against latency should not cost a
     /// rebuild. The value also becomes the configured one, so a later retrain
-    /// keeps it instead of reverting to the default ratio. Clamped to
-    /// `1..=nlist`; ignored while there is no index. Has no effect on the
-    /// default exact search, which decides for itself which cells to visit.
+    /// keeps it instead of recalibrating. Clamped to `1..=nlist`; ignored
+    /// while there is no index. Has no effect on the exact search, which
+    /// decides for itself which cells to visit.
     pub fn set_nprobe(&mut self, nprobe: usize) {
         let nlist = self.ivf.nlist();
         if nlist == 0 {
@@ -644,7 +682,7 @@ impl Engine {
         self.options.nprobe = Some(nprobe);
     }
 
-    /// Switch between exact (default) and approximate fixed-`nprobe` search.
+    /// Switch between approximate (default) and exact search.
     pub fn set_approximate(&mut self, approximate: bool) {
         self.options.approximate = approximate;
     }
@@ -879,8 +917,8 @@ impl Engine {
 
     /// Search for the `k` nearest neighbours of `query`.
     ///
-    /// Exact unless `options.approximate` is set; `SearchOutcome::exact` says
-    /// which. `k` is clamped to the number of stored vectors, so an absurd `k`
+    /// Approximate unless `options.approximate` is off; `SearchOutcome::exact`
+    /// says which came back. `k` is clamped to the number of stored vectors, so an absurd `k`
     /// costs nothing extra. A query containing NaN or infinity has no
     /// meaningful neighbours and returns none — the wasm binding reports it as
     /// an error before getting here.
@@ -901,7 +939,9 @@ impl Engine {
         if self.ivf.is_empty() {
             return self.search_flat(&prepared, k);
         }
-        if self.options.approximate {
+        // A probe of every cell would scan every row; the pruned search does
+        // no more work than that and is exact.
+        if self.options.approximate && self.effective_nprobe(k) < self.ivf.nlist() {
             return self.search_approximate(&prepared, k);
         }
         self.search_pruned(&prepared, k)
@@ -964,6 +1004,19 @@ impl Engine {
     /// Exact search over the IVF cells, pruned by the per-cell radius bound.
     /// See the module docs for why this is exact.
     fn search_pruned(&self, query: &[f32], k: usize) -> SearchOutcome {
+        let (top, scored, probed) = self.pruned_top(query, k);
+        SearchOutcome {
+            neighbors: self.collect(&top),
+            candidates_scored: scored,
+            rescored: 0,
+            cells_probed: probed,
+            exact: true,
+        }
+    }
+
+    /// The exact top `k` as `(score, row)`, with the rows scored and cells
+    /// probed to find it.
+    fn pruned_top(&self, query: &[f32], k: usize) -> (Vec<(f32, u32)>, usize, usize) {
         let query_norm = simd::norm_sq(query).sqrt();
 
         // (lower bound, tie-break, cell). Visiting in bound order lets the scan
@@ -1000,13 +1053,7 @@ impl Engine {
             }
         }
 
-        SearchOutcome {
-            neighbors: self.collect(&top),
-            candidates_scored: scored,
-            rescored: 0,
-            cells_probed: probed,
-            exact: true,
-        }
+        (top, scored, probed)
     }
 
     /// A lower bound on the score of any row filed in `cell`, plus the
@@ -1073,47 +1120,78 @@ impl Engine {
         (bound, closeness)
     }
 
-    /// Approximate search: probe a fixed `nprobe` cells, optionally prefilter
-    /// with PQ, rescore exactly.
+    /// Approximate search: probe `effective_nprobe(k)` cells, optionally
+    /// prefilter with PQ, rescore exactly.
     fn search_approximate(&self, query: &[f32], k: usize) -> SearchOutcome {
-        let dim = self.dim;
-        let nlist = self.ivf.nlist();
-        let query_norm = simd::norm_sq(query).sqrt();
+        let probe = self.probe_top(query, k, self.effective_nprobe(k));
 
-        // 1. Coarse: pick the `nprobe` most promising cells.
-        //
-        // Euclidean and Cosine rank by exact `l2_sq` to the centroid — the same
-        // function rows were filed with. Ranking by the cached-norm expansion
-        // `|q|² + |c|² - 2q·c` instead disagreed with the assignment after
-        // rounding, so a query could miss the very cell its twin was filed in.
-        // Dot product ranks by the upper bound `q·c + |q|·r`: ranking by
-        // centroid L2 skipped large-norm rows, which are exactly the ones an
-        // inner-product search is looking for.
-        let mut cell_scores: Vec<(f32, u32)> = (0..nlist)
+        // Recall guard: the probed cells did not hold `k` live rows, so the
+        // answer would come back short. Fall back to the exact search.
+        if probe.top.len() < k {
+            let mut outcome = self.search_pruned(query, k);
+            outcome.candidates_scored += probe.scored;
+            return outcome;
+        }
+
+        SearchOutcome {
+            neighbors: self.collect(&probe.top),
+            candidates_scored: probe.scored,
+            rescored: probe.rescored,
+            cells_probed: probe.cells,
+            exact: false,
+        }
+    }
+
+    /// Every cell, scored the way the approximate search ranks them — lower
+    /// is more promising; sort with [`cmp_cell`].
+    ///
+    /// Euclidean and Cosine rank by exact `l2_sq` to the centroid — the same
+    /// function rows were filed with. Ranking by the cached-norm expansion
+    /// `|q|² + |c|² - 2q·c` instead disagreed with the assignment after
+    /// rounding, so a query could miss the very cell its twin was filed in.
+    /// Dot product ranks by the upper bound `q·c + |q|·r`: ranking by centroid
+    /// L2 skipped large-norm rows, which are exactly the ones an inner-product
+    /// search is looking for.
+    fn cell_scores(&self, query: &[f32]) -> Vec<(f32, u32)> {
+        let query_norm = simd::norm_sq(query).sqrt();
+        (0..self.ivf.nlist())
             .map(|cell| {
                 let score = match self.distance {
                     Distance::Euclidean | Distance::Cosine => {
-                        simd::l2_sq(query, self.ivf.centroid(cell, dim))
+                        simd::l2_sq(query, self.ivf.centroid(cell, self.dim))
                     }
                     Distance::DotProduct => self.cell_bound(query, query_norm, cell).0,
                 };
                 let score = if score.is_nan() { f32::INFINITY } else { score };
                 (score, cell as u32)
             })
-            .collect();
+            .collect()
+    }
 
-        let nprobe = self.effective_nprobe(k).clamp(1, nlist.max(1));
+    /// `true` when approximate searches prefilter with PQ. Its tables
+    /// approximate squared L2, so it is never used for dot product.
+    fn uses_pq(&self) -> bool {
+        !self.pq.is_empty()
+            && !self.options.exact_rescore_only
+            && self.distance != Distance::DotProduct
+    }
+
+    /// The top `k` from the `nprobe` best-ranked cells.
+    fn probe_top(&self, query: &[f32], k: usize, nprobe: usize) -> Probe {
+        let dim = self.dim;
+        let nlist = self.ivf.nlist();
+
+        // 1. Coarse: pick the `nprobe` most promising cells.
+        let mut cell_scores = self.cell_scores(query);
+        let nprobe = nprobe.clamp(1, nlist.max(1));
         if nprobe < cell_scores.len() {
-            cell_scores.select_nth_unstable_by(nprobe - 1, |a, b| cmp_score(a.0, b.0));
+            cell_scores.select_nth_unstable_by(nprobe - 1, cmp_cell);
             cell_scores.truncate(nprobe);
         }
-        cell_scores.sort_unstable_by(|a, b| cmp_score(a.0, b.0));
+        cell_scores.sort_unstable_by(cmp_cell);
 
-        // 2. PQ prefilter, where it applies. Its tables approximate squared
-        //    L2, so it is never used for dot product.
-        let use_pq = !self.pq.is_empty()
-            && !self.options.exact_rescore_only
-            && self.distance != Distance::DotProduct;
+        // 2. PQ prefilter, where it applies.
+        let use_pq = self.uses_pq();
         let budget = k.saturating_mul(RESCORE_FACTOR).max(MIN_RESCORE_CANDIDATES);
 
         let mut candidates: Vec<(f32, u32)> = Vec::new();
@@ -1184,21 +1262,142 @@ impl Engine {
             insert_top(&mut top, score, row, k);
         }
 
-        // 4. Recall guard: the probed cells did not hold `k` live rows, so the
-        //    answer would come back short. Fall back to the exact search.
-        if top.len() < k {
-            let mut outcome = self.search_pruned(query, k);
-            outcome.candidates_scored += scored;
-            return outcome;
+        Probe {
+            top,
+            scored,
+            rescored,
+            cells: cell_scores.len(),
+        }
+    }
+
+    /// The smallest `nprobe` whose recall@[`CALIBRATION_K`] reaches
+    /// [`TARGET_RECALL`] on the corpus itself.
+    ///
+    /// Leave-one-out: up to [`CALIBRATION_QUERIES`] stored rows, spread over
+    /// the arena, each serve as a query with the row itself removed from both
+    /// answers, so each stands in for a fresh vector from the same source.
+    /// Their true neighbours come from the exact pruned search.
+    ///
+    /// Without PQ every row in a probed cell is scored exactly, so a true
+    /// neighbour is found exactly when its cell ranks inside the probe. One
+    /// ranking per query therefore gives the recall of *every* `nprobe` at
+    /// once. With PQ the prefilter can lose neighbours too, so values from that
+    /// starting point upwards are measured by running the search; if probing
+    /// every cell still misses the target, PQ is dropped — a prefilter that
+    /// cannot find the neighbours is not worth keeping.
+    ///
+    /// The result is at least [`MIN_CALIBRATED_NPROBE`]. Costs about
+    /// [`CALIBRATION_QUERIES`] exact searches per training run.
+    fn calibrate_nprobe(&mut self) -> usize {
+        let nlist = self.ivf.nlist();
+        let live = self.ids.len();
+        if nlist <= 1 || live < 2 {
+            return nlist.max(1);
         }
 
-        SearchOutcome {
-            neighbors: self.collect(&top),
-            candidates_scored: scored,
-            rescored,
-            cells_probed: cell_scores.len(),
-            exact: false,
+        let k = CALIBRATION_K.min(live - 1);
+        let step = live.div_ceil(CALIBRATION_QUERIES).max(1);
+        let queries: Vec<u32> = self
+            .ids
+            .entries()
+            .map(|(row, _)| row)
+            .step_by(step)
+            .collect();
+
+        let mut cell_of = vec![u32::MAX; self.store.rows()];
+        for (cell, list) in self.ivf.lists.iter().enumerate() {
+            for &row in list {
+                if let Some(slot) = cell_of.get_mut(row as usize) {
+                    *slot = cell as u32;
+                }
+            }
         }
+
+        // `found_at[rank]`: true neighbours filed in the cell a query ranks
+        // `rank`-th. A neighbour in no list is never found and adds nothing.
+        let mut found_at = vec![0usize; nlist];
+        let mut rank_of = vec![0usize; nlist];
+        let mut cases: Vec<(Vec<f32>, u32, Vec<u32>)> = Vec::with_capacity(queries.len());
+
+        for &row in &queries {
+            let query = self.store.row(row as usize).to_vec();
+            let (top, _, _) = self.pruned_top(&query, k + 1);
+            let truth: Vec<u32> = top
+                .iter()
+                .map(|&(_, r)| r)
+                .filter(|&r| r != row)
+                .take(k)
+                .collect();
+
+            let mut ranking = self.cell_scores(&query);
+            ranking.sort_unstable_by(cmp_cell);
+            for (rank, &(_, cell)) in ranking.iter().enumerate() {
+                rank_of[cell as usize] = rank;
+            }
+            for &neighbour in &truth {
+                if let Some(&rank) = cell_of
+                    .get(neighbour as usize)
+                    .and_then(|&cell| rank_of.get(cell as usize))
+                {
+                    found_at[rank] += 1;
+                }
+            }
+
+            cases.push((query, row, truth));
+        }
+
+        let total: usize = cases.iter().map(|(_, _, truth)| truth.len()).sum();
+        if total == 0 {
+            return 1;
+        }
+        let needed = (TARGET_RECALL * total as f32).ceil() as usize;
+
+        let mut nprobe = nlist;
+        let mut covered = 0usize;
+        for (rank, &count) in found_at.iter().enumerate() {
+            covered += count;
+            if covered >= needed {
+                nprobe = rank + 1;
+                break;
+            }
+        }
+        let nprobe = nprobe.max(MIN_CALIBRATED_NPROBE).min(nlist);
+
+        if !self.uses_pq() {
+            return nprobe;
+        }
+
+        let recall_at = |engine: &Engine, nprobe: usize| -> usize {
+            cases
+                .iter()
+                .map(|(query, row, truth)| {
+                    engine
+                        .probe_top(query, k + 1, nprobe)
+                        .top
+                        .iter()
+                        .map(|&(_, r)| r)
+                        .filter(|r| r != row)
+                        .take(k)
+                        .filter(|r| truth.contains(r))
+                        .count()
+                })
+                .sum()
+        };
+
+        let mut candidate = nprobe;
+        loop {
+            if recall_at(self, candidate) >= needed {
+                return candidate;
+            }
+            if candidate >= nlist {
+                break;
+            }
+            candidate = (candidate * 2).min(nlist);
+        }
+
+        self.pq = Pq::default();
+        self.codes.clear();
+        nprobe
     }
 
     /// Exact score of one row against a prepared query.
@@ -1243,15 +1442,25 @@ impl Engine {
             .collect()
     }
 
+    /// Cells to probe for a `k`-neighbour query.
+    ///
+    /// `nprobe` holds for `k` up to [`CALIBRATION_K`]. A larger `k` reaches
+    /// further from the query and into more cells, so the probe grows with
+    /// `sqrt(k / CALIBRATION_K)`: the extra neighbours sit on a slightly wider
+    /// shell, not in proportionally more cells. The engine tests check the
+    /// recall target still holds at `k = 50`.
     fn effective_nprobe(&self, k: usize) -> usize {
         let base = if self.nprobe > 0 {
             self.nprobe
         } else {
             self.default_nprobe()
         };
-        // Probing more cells than the answer needs is wasted work; probing too
-        // few loses recall. Scale with k, clamped to the cell count.
-        base.max((k / 4).max(1)).min(self.ivf.nlist().max(1))
+        let nlist = self.ivf.nlist().max(1);
+        if k <= CALIBRATION_K {
+            return base.clamp(1, nlist);
+        }
+        let scale = (k as f64 / CALIBRATION_K as f64).sqrt();
+        ((base as f64 * scale).ceil() as usize).clamp(1, nlist)
     }
 
     fn default_nprobe(&self) -> usize {
@@ -1388,14 +1597,14 @@ impl Engine {
 
         self.assign_all_rows();
         self.reorder_by_cell();
-        self.nprobe = self
-            .options
-            .nprobe
-            .unwrap_or_else(|| self.default_nprobe())
-            .clamp(1, nlist);
         self.rows_at_last_train = self.store.rows();
 
         self.train_pq();
+        // After PQ: with a prefilter the same recall can need more cells.
+        self.nprobe = match self.options.nprobe {
+            Some(nprobe) => nprobe.clamp(1, nlist),
+            None => self.calibrate_nprobe(),
+        };
     }
 
     /// Lay the arena out cell by cell, so every inverted list is a contiguous
@@ -1865,6 +2074,24 @@ pub struct SearchOutcome {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// What [`Engine::probe_top`] found.
+struct Probe {
+    top: Vec<(f32, u32)>,
+    /// Rows looked at, by PQ or exactly.
+    scored: usize,
+    /// Candidates rescored exactly after the PQ prefilter.
+    rescored: usize,
+    /// Cells probed.
+    cells: usize,
+}
+
+/// Order `(score, cell)` pairs best first. The cell index breaks ties, so the
+/// search and the calibration rank cells identically.
+#[inline]
+fn cmp_cell(a: &(f32, u32), b: &(f32, u32)) -> Ordering {
+    cmp_score(a.0, b.0).then(a.1.cmp(&b.1))
+}
+
 /// NaN-safe ascending comparison. `total_cmp` gives a total order over all f32
 /// bit patterns, so a NaN sorts to the end instead of scrambling the partition
 /// — the old `partial_cmp(..).unwrap_or(Ordering::Equal)` made NaNs compare
@@ -2032,6 +2259,13 @@ mod tests {
         IndexOptions {
             ivf_threshold: 256,
             ..Default::default()
+        }
+    }
+
+    fn exact_options() -> IndexOptions {
+        IndexOptions {
+            approximate: false,
+            ..options()
         }
     }
 
@@ -2517,14 +2751,14 @@ mod tests {
             .collect()
     }
 
-    /// The default search must return exactly what the brute-force scan
+    /// The exact-mode search must return exactly what the brute-force scan
     /// returns — same ids, same order up to ties — for every metric, on data
     /// with and without cluster structure.
     fn assert_matches_exact(engine: &Engine, queries: &[Embedding], k: usize, label: &str) {
         for (q, query) in queries.iter().enumerate() {
             let fast = engine.search(query, k);
             let slow = engine.search_exact(query, k);
-            assert!(fast.exact, "{label}: default search must report exact");
+            assert!(fast.exact, "{label}: exact mode must report exact");
             assert_eq!(fast.neighbors.len(), slow.neighbors.len(), "{label} q{q}");
             for (a, b) in fast.neighbors.iter().zip(&slow.neighbors) {
                 // Equal scores may come back in either order; equal *ids* at
@@ -2554,8 +2788,7 @@ mod tests {
                     &ids,
                     IndexOptions {
                         distance,
-                        ivf_threshold: 256,
-                        ..Default::default()
+                        ..exact_options()
                     },
                 )
                 .expect("build");
@@ -2571,7 +2804,7 @@ mod tests {
     #[test]
     fn pruned_search_stays_exact_through_mutation_and_reload() {
         let data = clustered(2500, 16, 12, 0.2, 0x77);
-        let mut engine = Engine::build(&data, &ids_of(2500), options()).expect("build");
+        let mut engine = Engine::build(&data, &ids_of(2500), exact_options()).expect("build");
 
         // Rows added after training land outside the contiguous cell runs and
         // widen their cell's radius; deletions leave stale radii behind. Both
@@ -2588,7 +2821,9 @@ mod tests {
         let queries: Vec<Embedding> = (0..25).map(|i| pseudo(0xE00 + i, 16)).collect();
         assert_matches_exact(&engine, &queries, 7, "mutated");
 
-        let restored = load(&engine.serialize(true).expect("serialize")).expect("load");
+        let restored =
+            load_with_options(&engine.serialize(true).expect("serialize"), exact_options())
+                .expect("load");
         assert_matches_exact(&restored, &queries, 7, "restored");
         for query in &queries {
             assert_eq!(
@@ -2601,7 +2836,7 @@ mod tests {
     #[test]
     fn pruned_search_skips_cells_on_clustered_data() {
         let data = clustered(8000, 32, 64, 0.05, 0x99);
-        let engine = Engine::build(&data, &ids_of(8000), options()).expect("build");
+        let engine = Engine::build(&data, &ids_of(8000), exact_options()).expect("build");
 
         let outcome = engine.search(&data[123], 10);
         assert!(outcome.exact);
@@ -2844,6 +3079,142 @@ mod tests {
             .expect("remove");
         assert_eq!(engine.dead_rows(), 0, "40% dead compacts");
         assert_eq!(engine.rows_at_last_train, 600);
+    }
+
+    /// Recall@k of the default search against the brute-force answer.
+    fn recall(engine: &Engine, queries: &[Embedding], k: usize) -> f32 {
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for query in queries {
+            let truth: HashSet<String> = engine
+                .search_exact(query, k)
+                .neighbors
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
+            total += truth.len();
+            hits += engine
+                .search(query, k)
+                .neighbors
+                .iter()
+                .filter(|n| truth.contains(&n.id))
+                .count();
+        }
+        hits as f32 / total.max(1) as f32
+    }
+
+    /// `count` stored vectors and 64 fresh queries from the same source.
+    fn split(mut all: Vec<Embedding>, count: usize) -> (Vec<Embedding>, Vec<Embedding>) {
+        let queries = all.split_off(count);
+        (all, queries)
+    }
+
+    #[test]
+    fn default_search_meets_the_recall_target() {
+        // Fresh queries, not stored rows: calibration estimates recall from
+        // stored rows, and this checks the estimate carries over.
+        let dim = 32;
+        let n = 4_000;
+        let cases = [
+            ("clustered", split(clustered(n + 64, dim, 40, 0.15, 7), n)),
+            ("uniform", split(corpus(n + 64, dim), n)),
+        ];
+
+        for (label, (data, queries)) in &cases {
+            for distance in [Distance::Euclidean, Distance::Cosine, Distance::DotProduct] {
+                let engine = Engine::build(
+                    data,
+                    &ids_of(n),
+                    IndexOptions {
+                        distance,
+                        ..options()
+                    },
+                )
+                .expect("build");
+                assert!(engine.is_indexed());
+
+                for k in [1, 10, 50] {
+                    let measured = recall(&engine, queries, k);
+                    assert!(
+                        measured >= 0.9,
+                        "{label} {distance:?} k={k}: recall {measured} with nprobe {} of {}",
+                        engine.nprobe(),
+                        engine.nlist()
+                    );
+                }
+
+                if *label == "clustered" && distance != Distance::DotProduct {
+                    // The point of approximate search: few cells on data with
+                    // structure.
+                    assert!(
+                        engine.nprobe() * 4 <= engine.nlist(),
+                        "{label} {distance:?}: nprobe {} of {}",
+                        engine.nprobe(),
+                        engine.nlist()
+                    );
+                    let outcome = engine.search(&queries[0], 10);
+                    assert!(!outcome.exact);
+                    assert!(outcome.candidates_scored < n / 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_nprobe_is_kept_and_exact_mode_is_exact() {
+        let data = clustered(2_000, 16, 20, 0.2, 3);
+        let engine = Engine::build(
+            &data,
+            &ids_of(2_000),
+            IndexOptions {
+                nprobe: Some(3),
+                ..options()
+            },
+        )
+        .expect("build");
+        assert_eq!(engine.nprobe(), 3);
+
+        let mut exact = engine.clone();
+        exact.set_approximate(false);
+        assert_matches_exact(&exact, &data[..20], 10, "exact mode");
+    }
+
+    #[test]
+    fn pq_that_misses_the_target_is_dropped() {
+        // Uniform noise in 64-d is close to incompressible: 8 bytes of PQ
+        // cannot rank it, and calibration must notice rather than ship a
+        // prefilter that loses most neighbours.
+        let (data, queries) = split(corpus(4_096 + 64, 64), 4_096);
+        let engine = Engine::build(
+            &data,
+            &ids_of(4_096),
+            IndexOptions {
+                exact_rescore_only: false,
+                ..options()
+            },
+        )
+        .expect("build");
+
+        let measured = recall(&engine, &queries, 10);
+        assert!(
+            measured >= 0.9,
+            "recall {measured}, pq {}, nprobe {} of {}",
+            engine.has_pq(),
+            engine.nprobe(),
+            engine.nlist()
+        );
+    }
+
+    #[test]
+    fn calibration_survives_a_round_trip() {
+        let data = clustered(3_000, 16, 30, 0.2, 11);
+        let engine = Engine::build(&data, &ids_of(3_000), options()).expect("build");
+        let restored = load(&engine.serialize(true).expect("serialize")).expect("load");
+        assert_eq!(restored.nprobe(), engine.nprobe());
+        assert_eq!(
+            restored.search(&data[5], 10).neighbors,
+            engine.search(&data[5], 10).neighbors
+        );
     }
 
     #[test]

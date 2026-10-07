@@ -10,13 +10,14 @@
 //! * `flat` — brute force over the flat arena with SIMD kernels. This is the
 //!   reference: its recall is 1.0 by definition, because the ground truth is
 //!   computed with it.
-//! * `default` — `Engine::search` with default options: the IVF-pruned exact
-//!   search. Its recall must also print as 1.0; anything else is a bug.
-//! * `approx` — the same index in approximate mode (fixed `nprobe`), to show
-//!   what the opt-in trade buys on this data.
+//! * `default` — `Engine::search` with default options: approximate, with the
+//!   `nprobe` the index calibrated for recall@10 of 0.95. Its recall should
+//!   print at 0.9 or above.
+//! * `exact` — the same index with `approximate: false`: the IVF-pruned
+//!   exact search. Its recall must print as 1.0; anything else is a bug.
 //!
 //! The corpus is uniform random, which has no cluster structure — the worst
-//! case for any partitioning index, so `default` gains least here. See
+//! case for any partitioning index, so both gain least here. See
 //! `compare/src/sweep.rs` for clustered data, and `compare/src/main.rs` for
 //! the comparison against the pre-rewrite engine.
 //!
@@ -179,11 +180,11 @@ fn main() {
                 &truth,
             );
 
-            let mut approximate = engine.clone();
-            approximate.set_approximate(true);
-            let approx = measure(
+            let mut exact_engine = engine.clone();
+            exact_engine.set_approximate(false);
+            let exact = measure(
                 |query, k| {
-                    approximate
+                    exact_engine
                         .search(&queries[query], k)
                         .neighbors
                         .into_iter()
@@ -216,11 +217,11 @@ fn main() {
                 speedup(&default),
             );
             println!(
-                "    approx    {:>10.3} ms  p50 {:>10.3} ms  recall {:.3}   {:>6.1}x vs flat",
-                ms(approx.mean),
-                ms(approx.p50),
-                approx.recall,
-                speedup(&approx),
+                "    exact     {:>10.3} ms  p50 {:>10.3} ms  recall {:.3}   {:>6.1}x vs flat",
+                ms(exact.mean),
+                ms(exact.p50),
+                exact.recall,
+                speedup(&exact),
             );
 
             let outcome = engine.search(&queries[0], K);

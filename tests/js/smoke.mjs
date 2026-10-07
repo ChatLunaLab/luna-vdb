@@ -361,10 +361,11 @@ test('searchExact is exact', () => {
   assert.equal(exact.neighbors[0].id, 'e4')
 })
 
-test('default search is exact', () => {
-  const db = new LunaVDB({ ivfThreshold: 256 })
+test('approximate: false is exact', () => {
+  const db = new LunaVDB({ ivfThreshold: 256, approximate: false })
   db.index(makeResource(3000, 'x'))
   assert.ok(db.stats().indexed)
+  assert.equal(db.stats().approximate, false)
 
   for (const seed of [10_001, 10_002, 10_003, 10_004, 10_005]) {
     const query = Array.from(vector(seed))
@@ -375,13 +376,27 @@ test('default search is exact', () => {
   }
 })
 
-test('approximate mode is opt-in and says so', () => {
-  const db = new LunaVDB({ ivfThreshold: 256, approximate: true, nprobe: 2 })
+test('default search is approximate and keeps recall at 0.9 or better', () => {
+  const db = new LunaVDB({ ivfThreshold: 256 })
+  db.index(makeResource(3000, 'a'))
+  assert.equal(db.stats().approximate, true)
+
+  let hits = 0
+  for (let seed = 20_001; seed <= 20_020; seed += 1) {
+    const query = Array.from(vector(seed))
+    const truth = new Set(db.searchExact(query, 10).neighbors.map((n) => n.id))
+    hits += db.search(query, 10).neighbors.filter((n) => truth.has(n.id)).length
+  }
+  assert.ok(hits / 200 >= 0.9, `recall was ${hits / 200}`)
+})
+
+test('an explicit nprobe is honoured and reported', () => {
+  const db = new LunaVDB({ ivfThreshold: 256, nprobe: 2 })
   db.index(makeResource(3000, 'a'))
   const result = db.search(Array.from(vector(7)), 10)
   assert.equal(result.exact, false)
   assert.ok(result.scanned < 3000)
-  assert.equal(db.stats().approximate, true)
+  assert.equal(db.stats().nprobe, 2)
 })
 
 test('a malformed argument throws and does not lock the handle', () => {
