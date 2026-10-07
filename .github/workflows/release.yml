@@ -5,7 +5,7 @@ name: Release
 #   git tag v1.0.0 && git push origin v1.0.0
 #
 # The tag must equal the version in both `Cargo.toml` and `package.json`
-# (with a leading `v`). The whole CI workflow runs first, and the npm package
+# (with a leading `v`), and point at a commit already on `main`. The whole CI workflow runs first, and the npm package
 # is the `pkg` artifact that run built and smoke-tested — not a second build.
 #
 # Credentials:
@@ -53,11 +53,22 @@ jobs:
       npm-tag: ${{ steps.check.outputs.npm-tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, so the tagged commit can be checked against `main`.
+          fetch-depth: 0
 
       - id: check
         run: |
           if [ "$GITHUB_REF_TYPE" != tag ]; then
             echo "::error::Release runs from a tag (v1.2.3), not from $GITHUB_REF"
+            exit 1
+          fi
+
+          # The environments match the tag *name* only, so without this a `v*`
+          # tag on an unmerged commit would publish code that never passed
+          # review.
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main; merge first, then tag"
             exit 1
           fi
 
