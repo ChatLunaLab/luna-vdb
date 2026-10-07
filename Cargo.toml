@@ -1,49 +1,76 @@
 [package]
 name = "luna-vdb"
-version = "0.0.1"
+version = "1.0.0"
 authors = ["dingyi <dingyi222666@foxmail.com>"]
 edition = "2024"
+description = "Lightweight, local, WASM-first vector database"
+license = "MIT"
+repository = "https://github.com/ChatLunaLab/luna-vdb.git"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["console_error_panic_hook"]
+# Enables `wasm_simd` on wasm32 builds. This must be enabled at *build* time
+# via `RUSTFLAGS="-C target-feature=+simd128"`; see scripts/build.sh.
+console_error_panic_hook = ["dep:console_error_panic_hook"]
 
 [dependencies]
 wasm-bindgen = "0.2.104"
-
-# The `console_error_panic_hook` crate provides better debugging of panics by
-# logging them with `console.error`. This is great for development, but requires
-# all the `std::fmt` and `std::panicking` infrastructure, so isn't great for
-# code size when deploying.
-console_error_panic_hook = { version = "0.1.7", optional = true }
-tsify = { version = "0.4.5", features = ["js"] }
-serde = "1.0.217"
+serde = { version = "1.0.217", features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
-wee_alloc = { version = "0.4.5", optional = true }
+tsify = { version = "0.4.5", features = ["js"] }
+bytemuck = { version = "1.21", features = ["derive"] }
+# Only used to read snapshots written by luna-vdb <= 0.0.12 (gzip + bincode v1).
 flate2 = "1.0.35"
 bincode = "1.3.3"
+console_error_panic_hook = { version = "0.1.7", optional = true }
+
+# `js-sys` is only reachable from the wasm bindings. Scoping it to the wasm32
+# target keeps the native test build free of a crate that assumes a JS host.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.77"
 
 [dev-dependencies]
-getrandom = { version = "0.2.15", features = ["js"] }
-wasm-bindgen-test = "0.3.34"
-web-sys = { version = "0.3.67", features = ["console"] }
+wasm-bindgen-test = "0.3.45"
+web-sys = { version = "0.3.77", features = ["console"] }
 
 [profile.release]
-# Tell `rustc` to optimize for small code size.
-opt-level = "s"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Note: no `panic = "abort"`. The engine has no panic path on user input
+# (clippy's `unwrap_used`/`panic` lints are denied in `lib.rs`), so unwinding
+# tables cost nothing at runtime, and keeping them lets `cargo test --release`
+# report a failed assertion instead of aborting the whole binary.
+#
+# `wasm32-unknown-unknown` does not support `panic = "unwind"` at all, so this
+# line must stay omitted — setting it explicitly is a hard error for wasm builds.
+debug = false
+strip = true
 
 [profile.dev]
+opt-level = 1
 debug = true
 debug-assertions = true
-opt-level = 1
+
+# `cargo bench` needs real optimisations even though it uses the `bench`
+# profile; inherit release and keep symbols so profiles are readable.
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = true
+wasm-opt = ["-O4", "--enable-simd", "--enable-bulk-memory"]
 
 [package.metadata.wasm-pack]
 skip-pkg-json = true
 
 [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
 dwarf-debug-info = true
+
+[[bench]]
+name = "search"
+harness = false

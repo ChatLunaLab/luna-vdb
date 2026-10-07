@@ -1,0 +1,239 @@
+name: CI
+
+# Every build runs here. Nothing is compiled on a developer machine — the
+# wasm32 target, the SIMD-flag build, the browser tests and the native tests all
+# need a toolchain that is easier to pin in CI than to reproduce per laptop.
+#
+# The same steps run on the internal build host via `scripts/remote-build.sh`,
+# for when you want a result without waiting on a runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on the first warning; the crate is warning-clean and should stay so.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Native: the engine is pure Rust, so most correctness lives here.
+  # ---------------------------------------------------------------------------
+  native:
+    name: Native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit + integration tests
+        run: cargo test --all-features --verbose
+
+      - name: Benchmarks compile
+        run: cargo bench --no-run --bench search
+
+  # ---------------------------------------------------------------------------
+  # wasm32, scalar: the baseline that must run on every runtime, including ones
+  # without SIMD support.
+  #
+  # Each wasm job builds into its own `CARGO_TARGET_DIR`. Sharing the default
+  # path would let the SIMD job's artifact overwrite the scalar job's, and the
+  # opcode assertions below would then be checking the wrong file — the check
+  # would pass by accident for exactly the bug it exists to catch.
+  # ---------------------------------------------------------------------------
+  wasm-scalar:
+    name: wasm32 (scalar)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: target/scalar
+      RUSTFLAGS: -D warnings -C target-feature=-simd128
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (wasm32)
+        run: cargo clippy --target wasm32-unknown-unknown --all-features -- -D warnings
+
+      - name: Build (wasm32)
+        run: cargo build --release --target wasm32-unknown-unknown --all-features
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: wasm-pack test (node)
+        run: wasm-pack test --node -- --features console_error_panic_hook
+
+      - name: Verify the module is SIMD-free
+        # A scalar artifact must not contain SIMD128 opcodes, or a runtime
+        # without them will refuse to instantiate it.
+        run: |
+          cargo install wasm-tools --locked
+          wasm-tools print "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/luna_vdb.wasm" > module.wat
+          if grep -qE 'f32x4\.(add|mul|sub)|v128\.load' module.wat; then
+            echo "::error::scalar build contains SIMD128 instructions"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # wasm32 + SIMD128: the fast path, and the one the browser tests exercise.
+  # ---------------------------------------------------------------------------
+  wasm-simd:
+    name: wasm32 (simd128)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: target/simd
+      RUSTFLAGS: -D warnings -C target-feature=+simd128
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (wasm32 + simd128)
+        run: cargo clippy --target wasm32-unknown-unknown --all-features -- -D warnings
+
+      - name: Build (wasm32 + simd128)
+        run: cargo build --release --target wasm32-unknown-unknown --all-features
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: wasm-pack test (node)
+        run: wasm-pack test --node -- --features console_error_panic_hook
+
+      - name: wasm-pack test (headless chrome)
+        run: wasm-pack test --headless --chrome -- --features console_error_panic_hook
+
+      - name: Verify the SIMD section is present
+        # The mirror of the scalar check: this build must actually contain
+        # vector instructions. If a refactor accidentally routes the SIMD
+        # configuration to the scalar kernels, the tests still pass and only
+        # this catches it.
+        run: |
+          cargo install wasm-tools --locked
+          wasm-tools print "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/luna_vdb.wasm" > module.wat
+          if ! grep -qE 'f32x4\.(add|mul|sub)' module.wat; then
+            echo "::error::simd128 build has no vector instructions — the kernel is not being used"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Package: build the published artifacts and run the JS-level smoke test
+  # against them, including the legacy-snapshot import path.
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package smoke test
+    runs-on: ubuntu-latest
+    needs: [wasm-scalar, wasm-simd]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      # `wasm-opt` comes from binaryen and is not on crates.io — `cargo install
+      # wasm-opt` fails. `scripts/build.sh` treats it as optional, so the
+      # package still builds without it; the release tarball below is the cheap
+      # way to get it in the common case. Bump the tag deliberately: these are
+      # not stable URLs, and a wrong one 404s the step.
+      - name: Install wasm-opt (binaryen)
+        env:
+          BINARYEN_VERSION: version_133
+        run: |
+          curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | tar xz -C /tmp
+          echo "/tmp/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+          wasm-opt --version
+
+      - name: Build both packages
+        run: ./scripts/build.sh
+
+      - name: Install JS deps
+        run: corepack enable && yarn install --immutable
+
+      - name: Smoke test the node build
+        run: node tests/js/smoke.mjs
+
+      - name: Smoke test the browser bundle (scalar fallback path)
+        run: node tests/js/smoke-browser.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg
+          path: pkg/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Benchmark: informational, not a gate. It exists so a performance claim in a
+  # PR can be checked against a number rather than an opinion.
+  # ---------------------------------------------------------------------------
+  bench:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmark
+        run: cargo bench --bench search 2>&1 | tee bench.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench.txt
