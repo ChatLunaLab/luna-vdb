@@ -10,7 +10,19 @@ description = "Head-to-head benchmark: the rewritten engine against the last pre
 # which is the only way the speedup figure means anything.
 #
 # Run in CI (the `compare` job), never locally:
-#   cargo run --release --manifest-path compare/Cargo.toml
+#   cargo run --release --manifest-path compare/Cargo.toml --bin luna-vdb-legacy-compare
+#   cargo run --release --manifest-path compare/Cargo.toml --bin sweep
+
+# Explicit targets: the repository's `.gitignore` excludes every `bin/`
+# directory, so the conventional `src/bin/sweep.rs` would silently never be
+# committed.
+[[bin]]
+name = "luna-vdb-legacy-compare"
+path = "src/main.rs"
+
+[[bin]]
+name = "sweep"
+path = "src/sweep.rs"
 
 [dependencies]
 luna-vdb = { path = "..", default-features = false }

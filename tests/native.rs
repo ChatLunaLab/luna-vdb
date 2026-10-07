@@ -895,7 +895,10 @@ fn set_nprobe_retunes_without_rebuild() {
     let ids = ids_of(2_000, "v");
     let mut engine = build(&data, &ids, fast());
     let nlist = engine.nlist();
-    assert!(nlist > 1, "test corpus should be indexed, got nlist {nlist}");
+    assert!(
+        nlist > 1,
+        "test corpus should be indexed, got nlist {nlist}"
+    );
 
     // Clamped to `1..=nlist` at both ends.
     engine.set_nprobe(0);
