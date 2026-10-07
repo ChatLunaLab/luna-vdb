@@ -7,6 +7,9 @@
 //! * **search** — mean latency of the default `search` path on each engine,
 //!   with recall@10 measured against the exact answer. A speedup without the
 //!   recall next to it is not a speedup, so the two are always printed together.
+//!   Measured twice: on uniform noise, the worst case for any partitioning
+//!   index, and on a Gaussian mixture, which is closer to real embeddings (see
+//!   `data.rs`).
 //! * **exact scan** — the new engine's brute-force path, for reference: it is
 //!   what the index has to beat, and on small corpora it is what runs.
 //! * **snapshot** — serialise and restore time plus size, old gzip+bincode
@@ -26,6 +29,9 @@ use std::time::{Duration, Instant};
 
 use legacy::{EmbeddedResource as OldItem, LunaVDB as OldDb, Resource as OldResource};
 use luna_vdb::engine::{self as new_engine, Engine, IndexOptions};
+
+mod data;
+use data::{Data, generate};
 
 const K: usize = 10;
 const QUERIES: usize = 100;
@@ -49,33 +55,6 @@ const INGEST_ADDS: usize = 50;
 /// The old engine's per-add cost is a full index rebuild, so its run is capped
 /// by wall-clock and the per-add figure extrapolated from what completed.
 const INGEST_OLD_BUDGET: Duration = Duration::from_secs(90);
-
-fn splitmix(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-fn rng(seed: u64) -> impl FnMut() -> f32 {
-    let mut state = splitmix(seed) | 1;
-    move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
-    }
-}
-
-/// One independent stream per row, so adjacent rows are not correlated.
-fn corpus(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
-    (0..count)
-        .map(|row| {
-            let mut next = rng(splitmix(seed).wrapping_add(row as u64));
-            (0..dim).map(|_| next()).collect()
-        })
-        .collect()
-}
 
 fn ids_of(count: usize, prefix: &str) -> Vec<String> {
     (0..count).map(|i| format!("{prefix}{i}")).collect()
@@ -137,6 +116,43 @@ fn run_queries(
     }
 }
 
+/// Ground truth from the new engine's exact scan — both engines are Euclidean
+/// by default, and recall is computed on ids alone.
+fn exact_truth(engine: &Engine, queries: &[Vec<f32>]) -> Vec<HashSet<String>> {
+    queries
+        .iter()
+        .map(|query| {
+            engine
+                .search_exact(query, K)
+                .neighbors
+                .into_iter()
+                .map(|neighbor| neighbor.id)
+                .collect()
+        })
+        .collect()
+}
+
+fn time_old_search(db: &OldDb, queries: &[Vec<f32>], truth: &[HashSet<String>]) -> QueryStats {
+    run_queries(queries, truth, |query| {
+        db.search(query, K)
+            .neighbors
+            .into_iter()
+            .map(|neighbor| neighbor.id)
+            .collect()
+    })
+}
+
+fn time_new_search(engine: &Engine, queries: &[Vec<f32>], truth: &[HashSet<String>]) -> QueryStats {
+    run_queries(queries, truth, |query| {
+        engine
+            .search(&query, K)
+            .neighbors
+            .into_iter()
+            .map(|neighbor| neighbor.id)
+            .collect()
+    })
+}
+
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
@@ -155,6 +171,9 @@ struct Row {
     search_speedup: f64,
     old_recall: f64,
     new_recall: f64,
+    clustered_speedup: f64,
+    clustered_old_recall: f64,
+    clustered_new_recall: f64,
     build_speedup: f64,
     save_speedup: f64,
     load_speedup: f64,
@@ -171,9 +190,8 @@ fn main() {
 
     for &(dim, size) in &CASES {
         let seed = 0xC0FF_EE00 ^ ((dim as u64) << 32) ^ size as u64;
-        let data = corpus(size, dim, seed);
+        let (data, queries) = generate(Data::Uniform, size, QUERIES, dim, seed);
         let ids = ids_of(size, "v");
-        let queries = corpus(QUERIES, dim, seed ^ 0xBEEF);
 
         // -- build ---------------------------------------------------------
         let (new_db, new_build) = timed(|| Engine::build(&data, &ids, IndexOptions::default()));
@@ -188,38 +206,11 @@ fn main() {
         let resource = old_resource(&data, &ids);
         let (old_db, old_build) = timed(|| OldDb::new(Some(resource)));
 
-        // Ground truth from the new engine's exact scan — both engines are
-        // Euclidean by default, and recall is computed on ids alone.
-        let truth: Vec<HashSet<String>> = queries
-            .iter()
-            .map(|query| {
-                new_db
-                    .search_exact(query, K)
-                    .neighbors
-                    .into_iter()
-                    .map(|neighbor| neighbor.id)
-                    .collect()
-            })
-            .collect();
+        let truth = exact_truth(&new_db, &queries);
 
         // -- search --------------------------------------------------------
-        let old_search = run_queries(&queries, &truth, |query| {
-            old_db
-                .search(query, K)
-                .neighbors
-                .into_iter()
-                .map(|neighbor| neighbor.id)
-                .collect()
-        });
-
-        let new_search = run_queries(&queries, &truth, |query| {
-            new_db
-                .search(&query, K)
-                .neighbors
-                .into_iter()
-                .map(|neighbor| neighbor.id)
-                .collect()
-        });
+        let old_search = time_old_search(&old_db, &queries, &truth);
+        let new_search = time_new_search(&new_db, &queries, &truth);
 
         let new_exact = run_queries(&queries, &truth, |query| {
             new_db
@@ -229,6 +220,24 @@ fn main() {
                 .map(|neighbor| neighbor.id)
                 .collect()
         });
+
+        // -- search on clustered data -------------------------------------
+        let (clustered, clustered_queries) =
+            generate(Data::Clustered, size, QUERIES, dim, seed ^ 0xC1);
+        let clustered_new = match Engine::build(&clustered, &ids, IndexOptions::default()) {
+            Ok(engine) => engine,
+            Err(error) => {
+                println!("dim {dim} n {size}: new engine build failed on clustered data: {error}");
+                continue;
+            }
+        };
+        let clustered_truth = exact_truth(&clustered_new, &clustered_queries);
+        let clustered_old_db = OldDb::new(Some(old_resource(&clustered, &ids)));
+        let clustered_old =
+            time_old_search(&clustered_old_db, &clustered_queries, &clustered_truth);
+        let clustered_search =
+            time_new_search(&clustered_new, &clustered_queries, &clustered_truth);
+        drop(clustered_old_db);
 
         // -- snapshot ------------------------------------------------------
         let (old_bytes, old_save) = timed(|| old_db.serialize());
@@ -303,6 +312,17 @@ fn main() {
             new_exact.recall,
         );
         println!(
+            "  {:<12} old {:>10.4} ms   new {:>10.4} ms   {:>7.1}x   recall old {:.3} new {:.3}   (nprobe {} of {})",
+            format!("search/{}", Data::Clustered.name()),
+            ms(clustered_old.mean),
+            ms(clustered_search.mean),
+            ratio(clustered_old.mean, clustered_search.mean),
+            clustered_old.recall,
+            clustered_search.recall,
+            clustered_new.nprobe(),
+            clustered_new.nlist(),
+        );
+        println!(
             "  serialise    old {:>10.2} ms   new {:>10.2} ms   {:>7.1}x   size old {:.2} MiB new {:.2} MiB",
             ms(old_save),
             ms(new_save),
@@ -328,6 +348,9 @@ fn main() {
             search_speedup: ratio(old_search.mean, new_search.mean),
             old_recall: old_search.recall,
             new_recall: new_search.recall,
+            clustered_speedup: ratio(clustered_old.mean, clustered_search.mean),
+            clustered_old_recall: clustered_old.recall,
+            clustered_new_recall: clustered_search.recall,
             build_speedup: ratio(old_build, new_build),
             save_speedup: ratio(old_save, new_save),
             load_speedup: ratio(old_load, new_load),
@@ -337,9 +360,14 @@ fn main() {
     // -- ingest --------------------------------------------------------------
     println!("ingest: {INGEST_ADDS} single-vector adds onto n={INGEST_BASE}, dim {INGEST_DIM}");
 
-    let base = corpus(INGEST_BASE, INGEST_DIM, 0x1A6E57);
+    let (base, extra) = generate(
+        Data::Uniform,
+        INGEST_BASE,
+        INGEST_ADDS,
+        INGEST_DIM,
+        0x1A6E57,
+    );
     let base_ids = ids_of(INGEST_BASE, "b");
-    let extra = corpus(INGEST_ADDS, INGEST_DIM, 0xADD5);
     let extra_ids = ids_of(INGEST_ADDS, "x");
 
     let mut old_db = OldDb::new(Some(old_resource(&base, &base_ids)));
@@ -398,15 +426,21 @@ fn main() {
 
     // -- summary -------------------------------------------------------------
     println!("summary (old ÷ new; higher is better for the new engine)");
-    println!("  dim      n    search   recall old→new    build   serialise   restore");
+    println!("                 ------ uniform -------   ----- clustered ------");
+    println!(
+        "  dim      n     search  recall old→new     search  recall old→new    build   serialise   restore"
+    );
     for row in &rows {
         println!(
-            "  {:>4} {:>6}  {:>7.1}x     {:.3}→{:.3}   {:>6.1}x   {:>8.1}x  {:>7.1}x",
+            "  {:>4} {:>6}  {:>7.1}x    {:.3}→{:.3}   {:>7.1}x    {:.3}→{:.3}   {:>6.1}x   {:>8.1}x  {:>7.1}x",
             row.dim,
             row.size,
             row.search_speedup,
             row.old_recall,
             row.new_recall,
+            row.clustered_speedup,
+            row.clustered_old_recall,
+            row.clustered_new_recall,
             row.build_speedup,
             row.save_speedup,
             row.load_speedup,

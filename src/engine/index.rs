@@ -11,10 +11,11 @@
 //! as leave-one-out queries, their exact neighbours are found, and `nprobe` is
 //! set to the fewest cells that recover 95% of those neighbours
 //! (`TARGET_RECALL`, `Engine::calibrate_nprobe`). On clustered data — real embeddings —
-//! that is a handful of cells; on data with no structure at all it is most of
-//! them, and the search is barely faster than a scan, but it does not quietly
-//! return the wrong rows. (The pre-1.0 engine probed a fixed fraction and
-//! measured 0.000–0.005 recall@10 on such data.) An explicit `nprobe` turns the
+//! that is a handful of cells. On data with no structure at all it would be
+//! most of them, at no real saving over a scan, so calibration then sets
+//! `nprobe = nlist` and the search is exact instead of quietly returning the
+//! wrong rows. (The pre-1.0 engine probed a fixed fraction and measured
+//! 0.000–0.005 recall@10 on such data.) An explicit `nprobe` turns the
 //! calibration off.
 //!
 //! # Exact on request
@@ -93,6 +94,14 @@ const CALIBRATION_QUERIES: usize = 32;
 /// data one cell often reaches the target alone, and the second costs a few
 /// hundredths of a millisecond.
 const MIN_CALIBRATED_NPROBE: usize = 2;
+
+/// If the calibrated probe would still scan this fraction of the rows, probe
+/// every cell instead — which makes the search exact. On data with no cluster
+/// structure the target needs most cells, and those are the large ones near
+/// the middle of the data: CI measured 86–95% of rows scanned for 1.0–1.1x
+/// over the flat scan at recall 0.92–0.97. Full recall at the same speed is
+/// the better deal.
+const EXACT_FALLBACK_FRACTION: f32 = 0.5;
 
 /// Fallback `nprobe` when nothing was calibrated, as a fraction of `nlist`.
 const DEFAULT_NPROBE_RATIO: f32 = 0.05;
@@ -1286,7 +1295,9 @@ impl Engine {
     /// every cell still misses the target, PQ is dropped — a prefilter that
     /// cannot find the neighbours is not worth keeping.
     ///
-    /// The result is at least [`MIN_CALIBRATED_NPROBE`]. Costs about
+    /// The result is at least [`MIN_CALIBRATED_NPROBE`], and is `nlist` —
+    /// exact search — when an exactly-scored probe would cover
+    /// [`EXACT_FALLBACK_FRACTION`] of the rows anyway. Costs about
     /// [`CALIBRATION_QUERIES`] exact searches per training run.
     fn calibrate_nprobe(&mut self) -> usize {
         let nlist = self.ivf.nlist();
@@ -1318,6 +1329,8 @@ impl Engine {
         let mut found_at = vec![0usize; nlist];
         let mut rank_of = vec![0usize; nlist];
         let mut cases: Vec<(Vec<f32>, u32, Vec<u32>)> = Vec::with_capacity(queries.len());
+        // Per query, its cells best first — to count the rows a probe scans.
+        let mut orders: Vec<Vec<u32>> = Vec::with_capacity(queries.len());
 
         for &row in &queries {
             let query = self.store.row(row as usize).to_vec();
@@ -1344,7 +1357,25 @@ impl Engine {
             }
 
             cases.push((query, row, truth));
+            orders.push(ranking.into_iter().map(|(_, cell)| cell).collect());
         }
+
+        // Rows an exactly-scored probe of `nprobe` cells scans, as a fraction
+        // of all filed rows, averaged over the calibration queries.
+        let filed: usize = self.ivf.lists.iter().map(Vec::len).sum();
+        let scanned_fraction = |nprobe: usize| -> f32 {
+            let scanned: usize = orders
+                .iter()
+                .map(|order| {
+                    order
+                        .iter()
+                        .take(nprobe)
+                        .map(|&cell| self.ivf.lists[cell as usize].len())
+                        .sum::<usize>()
+                })
+                .sum();
+            scanned as f32 / (orders.len().max(1) * filed.max(1)) as f32
+        };
 
         let total: usize = cases.iter().map(|(_, _, truth)| truth.len()).sum();
         if total == 0 {
@@ -1362,9 +1393,14 @@ impl Engine {
             }
         }
         let nprobe = nprobe.max(MIN_CALIBRATED_NPROBE).min(nlist);
+        let flat = if scanned_fraction(nprobe) >= EXACT_FALLBACK_FRACTION {
+            nlist
+        } else {
+            nprobe
+        };
 
         if !self.uses_pq() {
-            return nprobe;
+            return flat;
         }
 
         let recall_at = |engine: &Engine, nprobe: usize| -> usize {
@@ -1397,7 +1433,7 @@ impl Engine {
 
         self.pq = Pq::default();
         self.codes.clear();
-        nprobe
+        flat
     }
 
     /// Exact score of one row against a prepared query.
@@ -3158,6 +3194,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unstructured_data_falls_back_to_exact() {
+        // Uniform noise in 256-d: reaching the recall target would mean
+        // probing most of the corpus, so calibration picks every cell.
+        let data = corpus(4_000, 256);
+        let engine = Engine::build(&data, &ids_of(4_000), options()).expect("build");
+        assert_eq!(engine.nprobe(), engine.nlist());
+        let query = pseudo(0xFEED, 256);
+        let outcome = engine.search(&query, 10);
+        assert!(outcome.exact);
+        assert_eq!(outcome.neighbors, engine.search_exact(&query, 10).neighbors);
     }
 
     #[test]
