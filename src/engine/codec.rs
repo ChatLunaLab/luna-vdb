@@ -22,9 +22,25 @@
 //!
 //! [`read`] sniffs the gzip magic (`1f 8b`) and routes to [`read_legacy`],
 //! which understands the old `bincode` layout. Old snapshots therefore keep
-//! loading; new ones are written in `LVD2` and are roughly 3x faster to read.
+//! loading; new ones are written in `LVD2`.
+//!
+//! # Layout
+//!
+//! ```text
+//! offset  size  field
+//!      0     4  magic "LVD2"
+//!      4     2  format version (u16 LE)
+//!      6     2  flags (bit 0: payload is LZ4-compressed)
+//!      8     4  raw payload length (u32 LE)
+//!     12     4  CRC-32 over bytes 4..12 followed by the stored payload
+//!     16     …  stored payload
+//! ```
+//!
+//! The checksum covers the version, flags and length as well as the payload,
+//! so a flipped bit in the header is caught before the length is used for
+//! anything.
 
-use crate::engine::crc32::crc32;
+use crate::engine::crc32::{crc32, crc32_update};
 use crate::engine::lz4;
 use crate::engine::types::{Distance, EngineError, EngineResult};
 
@@ -37,26 +53,42 @@ pub const HEADER_LEN: usize = 16;
 
 const FLAG_COMPRESSED: u16 = 1 << 0;
 
-/// Refuse to allocate more than this from a header. A corrupt length field is
-/// the single most likely way to turn a bad file into an OOM kill, so the
-/// ceiling is enforced before any allocation happens.
+/// Largest payload the format can describe: the length field is a `u32`.
 ///
-/// This is a `u64`, not a `usize`, and that is not cosmetic. Written as
-/// `8 << 30` in `usize`, the constant **overflows to zero on wasm32**, where
-/// `usize` is 32 bits — so every snapshot of any size was rejected as "too
-/// large to serialise", and every restore of any real file failed. Native
-/// builds (64-bit) never saw it. Anything compared against this must widen
-/// through [`max_raw_len`] rather than casting back down.
-const MAX_RAW_LEN: u64 = 8 << 30; // 8 GiB
+/// This used to be 8 GiB, which let a 64-bit host write a 4–8 GiB snapshot
+/// whose length silently truncated to 32 bits and could never be read back.
+/// (And written as `8 << 30` in `usize`, it overflowed to zero on wasm32, so
+/// every snapshot there was rejected as "too large".) Writes above this limit
+/// now fail up front.
+const MAX_RAW_LEN: u64 = u32::MAX as u64;
 
-/// The ceiling as a `usize`, saturated to what this target can actually index.
-///
-/// On a 32-bit target the real limit is `usize::MAX`, not 8 GiB: a snapshot
-/// that a wasm module could hold is bounded by its address space, and
-/// saturating here means the check never rejects a file for a reason the
-/// platform already guarantees.
+/// The ceiling as a `usize`, saturated to what this target can index.
 fn max_raw_len() -> usize {
     MAX_RAW_LEN.min(usize::MAX as u64) as usize
+}
+
+/// CRC of everything the header vouches for: version, flags, length, payload.
+fn envelope_crc(header: &[u8], stored: &[u8]) -> u32 {
+    crc32_update(crc32(header.get(4..12).unwrap_or(&[])), stored)
+}
+
+/// `true` if `bytes` starts like a snapshot this build can read: `LVD2`, or a
+/// gzip stream from luna-vdb ≤ 0.0.12. A header sniff only — it does not
+/// validate the payload.
+pub fn is_snapshot(bytes: &[u8]) -> bool {
+    bytes.starts_with(&MAGIC) || looks_like_gzip(bytes)
+}
+
+/// Format version of `bytes`: the `LVD2` header's version field, `1` for a
+/// legacy gzip snapshot, `0` if unrecognised.
+pub fn snapshot_version(bytes: &[u8]) -> u16 {
+    if bytes.len() >= 6 && bytes.starts_with(&MAGIC) {
+        u16::from_le_bytes([bytes[4], bytes[5]])
+    } else if looks_like_gzip(bytes) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Everything needed to rebuild an [`crate::engine::Engine`], in a plain
@@ -129,7 +161,8 @@ pub fn write(snapshot: &Snapshot, compressed: bool) -> EngineResult<Vec<u8>> {
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&(raw_len as u32).to_le_bytes());
-    out.extend_from_slice(&crc32(&stored).to_le_bytes());
+    let crc = envelope_crc(&out, &stored);
+    out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&stored);
 
     Ok(out)
@@ -312,7 +345,7 @@ pub fn read(bytes: &[u8]) -> EngineResult<Snapshot> {
     let expected_crc = reader.u32()?;
 
     // Compared as `u64` so the check means the same thing on every target.
-    if raw_len > MAX_RAW_LEN || raw_len > max_raw_len() as u64 {
+    if raw_len > max_raw_len() as u64 {
         return Err(EngineError::corrupt(format!(
             "declared payload of {raw_len} bytes exceeds the {} byte limit",
             max_raw_len()
@@ -322,12 +355,14 @@ pub fn read(bytes: &[u8]) -> EngineResult<Snapshot> {
 
     let stored = reader.take(reader.remaining())?;
 
-    // Verify the checksum *before* parsing: it turns "random garbage that
-    // happens to have plausible lengths" into one clear error.
-    let actual_crc = crc32(stored);
+    // Verify the checksum *before* using anything the header says: it turns
+    // "random garbage that happens to have plausible lengths" into one clear
+    // error, and it covers the length field, so a corrupted length never
+    // reaches an allocation.
+    let actual_crc = envelope_crc(bytes, stored);
     if actual_crc != expected_crc {
         return Err(EngineError::corrupt(format!(
-            "checksum mismatch: header says {expected_crc:#010x}, payload is {actual_crc:#010x}"
+            "checksum mismatch: header says {expected_crc:#010x}, contents give {actual_crc:#010x}"
         )));
     }
 
@@ -374,7 +409,10 @@ fn read_payload(payload: &[u8]) -> EngineResult<Snapshot> {
     let data = reader.floats(elements)?;
     let cache = reader.floats(count as usize)?;
 
-    let mut ids = Vec::with_capacity(count as usize);
+    // Every id costs at least its 4-byte length prefix, so the remaining
+    // bytes bound how many there can be — reserve no more than that, whatever
+    // `count` claims.
+    let mut ids = Vec::with_capacity((count as usize).min(reader.remaining() / 4));
     for _ in 0..count {
         ids.push(reader.string()?);
     }
@@ -382,11 +420,10 @@ fn read_payload(payload: &[u8]) -> EngineResult<Snapshot> {
     let nlist = reader.u32()?;
     let nprobe = reader.u32()?;
 
-    if nlist as usize > count as usize && count > 0 {
-        return Err(EngineError::corrupt(format!(
-            "nlist {nlist} exceeds the vector count {count}"
-        )));
-    }
+    // No `nlist <= count` check: deletions shrink the corpus without shrinking
+    // the cell count, so the engine legitimately writes more cells than rows,
+    // and rejecting that made such snapshots unloadable. Every list entry is
+    // checked against `count` below instead.
 
     let centroids = reader.floats(
         (nlist as usize)
@@ -394,7 +431,9 @@ fn read_payload(payload: &[u8]) -> EngineResult<Snapshot> {
             .ok_or_else(|| EngineError::corrupt("centroid count overflow"))?,
     )?;
 
-    let mut lists = Vec::with_capacity(nlist as usize);
+    // Each list costs at least a 4-byte length, so bound the reservation by
+    // the remaining bytes — `nlist` alone is attacker-controlled.
+    let mut lists = Vec::with_capacity((nlist as usize).min(reader.remaining() / 4));
     for _ in 0..nlist {
         let len = reader.u32()? as usize;
         if len > count as usize {
@@ -427,6 +466,13 @@ fn read_payload(payload: &[u8]) -> EngineResult<Snapshot> {
                 "PQ subquantizer count exceeds the dimension",
             ));
         }
+        // A code is one byte, so a codebook has at most 256 entries; and a
+        // zero-width subvector cannot encode anything.
+        if !(1..=256).contains(&ksub) || subvector_dim == 0 {
+            return Err(EngineError::corrupt(format!(
+                "PQ shape ksub={ksub} subvector_dim={subvector_dim} is invalid"
+            )));
+        }
 
         let codebook_len = (m as usize)
             .checked_mul(ksub as usize)
@@ -436,10 +482,10 @@ fn read_payload(payload: &[u8]) -> EngineResult<Snapshot> {
         let codebooks = reader.floats(codebook_len)?;
         let code_len = reader.u32()? as usize;
 
-        if code_len != count as usize * m as usize {
+        let expected_codes = (count as u64) * (m as u64);
+        if code_len as u64 != expected_codes {
             return Err(EngineError::corrupt(format!(
-                "code buffer is {code_len} bytes, expected {}",
-                count as usize * m as usize
+                "code buffer is {code_len} bytes, expected {expected_codes}"
             )));
         }
 
@@ -567,26 +613,55 @@ mod legacy {
 /// clusters [`crate::engine::kmeans`] exists to fix. The vectors and ids are
 /// what matter; the index is retrained on load.
 pub fn read_legacy(bytes: &[u8]) -> EngineResult<Snapshot> {
-    use std::io::Read;
-
-    let mut decoder = flate2::read::GzDecoder::new(bytes);
-    let mut raw = Vec::new();
-
-    decoder
-        .read_to_end(&mut raw)
-        .map_err(|error| EngineError::corrupt(format!("legacy gzip: {error}")))?;
+    let raw = inflate_capped(bytes, LEGACY_LIMIT)?;
 
     if let Ok(index) = bincode::deserialize::<legacy::LegacyIndex>(&raw) {
-        return Ok(convert_legacy(index));
+        return convert_legacy(
+            index.embeddings,
+            index.ids,
+            &index.distance,
+            index.dimension,
+        );
     }
 
     if let Ok(index) = bincode::deserialize::<legacy::LegacyIndexPreIvf>(&raw) {
-        return Ok(convert_legacy_pre_ivf(index));
+        return convert_legacy(
+            index.embeddings,
+            index.ids,
+            &index.distance,
+            index.dimension,
+        );
     }
 
     Err(EngineError::corrupt(
         "legacy snapshot did not match any known pre-0.1 layout",
     ))
+}
+
+/// Inflate at most this much from a legacy snapshot.
+const LEGACY_LIMIT: u64 = 1 << 30;
+
+/// Gunzip `bytes`, refusing output beyond `limit`.
+///
+/// A gzip stream can expand by ~1000x, so an unbounded `read_to_end` is a
+/// memory bomb. The cap also keeps the buffer's doubling growth inside a
+/// 32-bit address space, where `read_to_end` reports an allocation failure as
+/// an error rather than panicking.
+fn inflate_capped(bytes: &[u8], limit: u64) -> EngineResult<Vec<u8>> {
+    use std::io::Read;
+
+    let mut decoder = flate2::read::GzDecoder::new(bytes).take(limit.saturating_add(1));
+    let mut raw = Vec::new();
+    decoder
+        .read_to_end(&mut raw)
+        .map_err(|error| EngineError::corrupt(format!("legacy gzip: {error}")))?;
+
+    if raw.len() as u64 > limit {
+        return Err(EngineError::corrupt(format!(
+            "legacy snapshot inflates past {limit} bytes; refusing to import"
+        )));
+    }
+    Ok(raw)
 }
 
 fn legacy_distance(distance: &legacy::LegacyDistance) -> Distance {
@@ -597,60 +672,63 @@ fn legacy_distance(distance: &legacy::LegacyDistance) -> Distance {
     }
 }
 
-fn convert_legacy(index: legacy::LegacyIndex) -> Snapshot {
-    let dim = index.dimension;
-    let count = index.embeddings.len();
+/// Flatten the legacy per-vector layout.
+///
+/// The IVF structures are dropped on purpose: they were trained with the old
+/// modulo seeding, and the engine retrains on load. The `dimension` field is
+/// checked against the vectors themselves rather than trusted — it used to go
+/// straight into `Vec::with_capacity(count * dimension)`, so a single corrupt
+/// field could request terabytes, or wrap on wasm32 and slip past the length
+/// check that follows.
+fn convert_legacy(
+    embeddings: Vec<legacy::LegacyVectorData>,
+    ids: Vec<String>,
+    distance: &legacy::LegacyDistance,
+    dimension: usize,
+) -> EngineResult<Snapshot> {
+    let count = embeddings.len();
 
-    let mut data = Vec::with_capacity(count * dim);
+    if ids.len() != count {
+        return Err(EngineError::corrupt(format!(
+            "legacy snapshot has {} ids for {count} vectors",
+            ids.len()
+        )));
+    }
+    if let Some(bad) = embeddings.iter().find(|e| e.vector.len() != dimension) {
+        return Err(EngineError::corrupt(format!(
+            "legacy snapshot declares dimension {dimension} but holds a vector of length {}",
+            bad.vector.len()
+        )));
+    }
+    let dim = u32::try_from(dimension)
+        .map_err(|_| EngineError::corrupt("legacy dimension does not fit in 32 bits"))?;
+    let count_u32 = u32::try_from(count)
+        .map_err(|_| EngineError::corrupt("legacy vector count does not fit in 32 bits"))?;
+
+    // Every vector has been checked to hold `dimension` floats, so this is the
+    // size of data actually present, not a number read off the wire.
+    let total: usize = embeddings.iter().map(|e| e.vector.len()).sum();
+    let mut data = Vec::with_capacity(total);
     let mut cache = Vec::with_capacity(count);
-    for embedding in &index.embeddings {
+    for embedding in &embeddings {
         data.extend_from_slice(&embedding.vector);
         cache.push(embedding.cache_attr);
     }
 
-    Snapshot {
-        distance: legacy_distance(&index.distance),
-        dim: dim as u32,
-        count: count as u32,
+    Ok(Snapshot {
+        distance: legacy_distance(distance),
+        dim,
+        count: count_u32,
         data,
         cache,
-        ids: index.ids,
-        // Everything IVF-related is intentionally discarded; the engine
-        // retrains on load.
+        ids,
         nlist: 0,
         nprobe: 0,
         centroids: Vec::new(),
         lists: Vec::new(),
         pq: None,
         codes: Vec::new(),
-    }
-}
-
-fn convert_legacy_pre_ivf(index: legacy::LegacyIndexPreIvf) -> Snapshot {
-    let dim = index.dimension;
-    let count = index.embeddings.len();
-
-    let mut data = Vec::with_capacity(count * dim);
-    let mut cache = Vec::with_capacity(count);
-    for embedding in &index.embeddings {
-        data.extend_from_slice(&embedding.vector);
-        cache.push(embedding.cache_attr);
-    }
-
-    Snapshot {
-        distance: legacy_distance(&index.distance),
-        dim: dim as u32,
-        count: count as u32,
-        data,
-        cache,
-        ids: index.ids,
-        nlist: 0,
-        nprobe: 0,
-        centroids: Vec::new(),
-        lists: Vec::new(),
-        pq: None,
-        codes: Vec::new(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -753,18 +831,249 @@ mod tests {
         assert!(error.message.contains("not supported"), "{}", error.message);
     }
 
-    #[test]
-    fn rejects_implausible_lengths() {
-        // Hand-build a header claiming 4 GiB of vectors, with no payload
-        // behind it. The reader must reject on the length check rather than
-        // trying to allocate 4 GiB.
+    /// Assemble a header around `stored` with a *valid* checksum, so a test
+    /// exercises the length handling rather than being stopped by the CRC.
+    fn envelope(flags: u16, raw_len: u32, stored: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&MAGIC);
         bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&(4u32 << 30).to_le_bytes()); // raw_len
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // crc
-        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.extend_from_slice(&raw_len.to_le_bytes());
+        let crc = envelope_crc(&bytes, stored);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(stored);
+        bytes
+    }
+
+    #[test]
+    fn rejects_implausible_lengths() {
+        // REGRESSION: this test used to build its header with `4u32 << 30`,
+        // which is 0, and an all-zero CRC, so it passed on the checksum and
+        // never reached the length handling it was named for.
+        for stored in [&[][..], &[0x10, b'x'][..], &[0u8; 16][..]] {
+            for raw_len in [u32::MAX, 1 << 31, 1 << 30] {
+                let bytes = envelope(FLAG_COMPRESSED, raw_len, stored);
+                assert!(read(&bytes).is_err(), "raw_len {raw_len}");
+                let bytes = envelope(0, raw_len, stored);
+                assert!(read(&bytes).is_err(), "raw_len {raw_len}");
+            }
+        }
+    }
+
+    #[test]
+    fn header_fields_are_checksummed() {
+        let good = write(&sample(), true).expect("write");
+        for offset in 4..16 {
+            let mut bad = good.clone();
+            bad[offset] ^= 0x01;
+            assert!(read(&bad).is_err(), "flip at header byte {offset}");
+        }
+    }
+
+    #[test]
+    fn hostile_counts_do_not_allocate() {
+        // count = 0 with nlist = u32::MAX: the list reservation used to be
+        // `nlist` long, which is a capacity-overflow trap on wasm32.
+        let mut payload = vec![0u8, 0];
+        payload.extend_from_slice(&0u32.to_le_bytes()); // dim
+        payload.extend_from_slice(&0u32.to_le_bytes()); // count
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // nlist
+        payload.extend_from_slice(&0u32.to_le_bytes()); // nprobe
+        let bytes = envelope(0, payload.len() as u32, &payload);
         assert!(read(&bytes).is_err());
+
+        // A PQ block claiming a 2^32-entry codebook of zero-width vectors.
+        let mut snapshot = sample_with_pq();
+        snapshot.pq = Some(PqSnapshot {
+            m: 1,
+            ksub: u32::MAX,
+            subvector_dim: 0,
+            codebooks: Vec::new(),
+        });
+        snapshot.codes = vec![0, 0];
+        let bytes = write(&snapshot, false).expect("write");
+        assert!(read(&bytes).is_err());
+    }
+
+    #[test]
+    fn more_cells_than_rows_round_trips() {
+        // REGRESSION: deletions leave `nlist` above the row count, and the
+        // reader used to reject exactly the snapshots the engine wrote then.
+        let snapshot = Snapshot {
+            nlist: 4,
+            centroids: vec![0.0; 12],
+            lists: vec![vec![0, 1], Vec::new(), Vec::new(), Vec::new()],
+            ..sample()
+        };
+        let restored = read(&write(&snapshot, true).expect("write")).expect("read");
+        assert_eq!(restored.nlist, 4);
+        assert_eq!(restored.lists, snapshot.lists);
+    }
+
+    #[test]
+    fn sniffing_helpers() {
+        let bytes = write(&sample(), true).expect("write");
+        assert!(is_snapshot(&bytes));
+        assert_eq!(snapshot_version(&bytes), FORMAT_VERSION);
+        assert!(is_snapshot(&[0x1f, 0x8b, 0x08]));
+        assert_eq!(snapshot_version(&[0x1f, 0x8b, 0x08]), 1);
+        assert!(!is_snapshot(b"nope"));
+        assert_eq!(snapshot_version(&[]), 0);
+    }
+
+    // -- legacy import ----------------------------------------------------
+
+    /// The pre-0.1 types, as they were serialised. Field order and types are
+    /// copied from commit `ca10590` (`src/engine/types.rs`); bincode encodes
+    /// structs as bare field sequences, so this is the wire format.
+    mod old {
+        use serde::Serialize;
+        use std::collections::HashMap;
+
+        #[derive(Serialize)]
+        #[allow(dead_code)]
+        pub enum Distance {
+            Euclidean,
+            Cosine,
+            DotProduct,
+        }
+
+        #[derive(Serialize)]
+        pub struct VectorData {
+            pub vector: Vec<f32>,
+            pub cache_attr: f32,
+        }
+
+        #[derive(Serialize, Default)]
+        pub struct ProductQuantizer {
+            pub m: usize,
+            pub ksub: usize,
+            pub subvector_dim: usize,
+            pub codebooks: Vec<Vec<Vec<f32>>>,
+        }
+
+        #[derive(Serialize)]
+        pub struct Index {
+            pub embeddings: Vec<VectorData>,
+            pub hash: HashMap<u64, usize>,
+            pub ids: Vec<String>,
+            pub distance: Distance,
+            pub dimension: usize,
+            pub nlist: usize,
+            pub nprobe: usize,
+            pub coarse_centroids: Vec<Vec<f32>>,
+            pub coarse_assignments: Vec<usize>,
+            pub lists: Vec<Vec<usize>>,
+            pub pq: ProductQuantizer,
+            pub codes: Vec<Vec<u8>>,
+        }
+    }
+
+    fn gzip(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    fn old_index(vectors: Vec<Vec<f32>>, ids: Vec<&str>, dimension: usize) -> old::Index {
+        // Sized from the vectors, not `dimension`: the hostile-dimension test
+        // passes 2^40, and the fixture must not be the thing that allocates it.
+        let centroid = vec![0.0; vectors.first().map_or(0, Vec::len)];
+        old::Index {
+            embeddings: vectors
+                .into_iter()
+                .map(|vector| old::VectorData {
+                    cache_attr: vector.iter().map(|x| x * x).sum(),
+                    vector,
+                })
+                .collect(),
+            hash: std::collections::HashMap::new(),
+            ids: ids.into_iter().map(String::from).collect(),
+            distance: old::Distance::Cosine,
+            dimension,
+            nlist: 1,
+            nprobe: 1,
+            coarse_centroids: vec![centroid],
+            coarse_assignments: vec![0, 0],
+            lists: vec![vec![0, 1]],
+            pq: old::ProductQuantizer::default(),
+            codes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn imports_a_legacy_snapshot() {
+        let index = old_index(
+            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+            vec!["a", "b"],
+            3,
+        );
+        let bytes = gzip(&bincode::serialize(&index).expect("bincode"));
+
+        assert!(is_snapshot(&bytes));
+        let snapshot = read(&bytes).expect("legacy import");
+        assert_eq!(snapshot.distance, Distance::Cosine);
+        assert_eq!(snapshot.dim, 3);
+        assert_eq!(snapshot.count, 2);
+        assert_eq!(snapshot.ids, vec!["a", "b"]);
+        assert_eq!(snapshot.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            snapshot.nlist, 0,
+            "the old index is discarded and retrained"
+        );
+    }
+
+    #[test]
+    fn legacy_dimension_is_checked_not_trusted() {
+        // REGRESSION: `dimension` went straight into
+        // `Vec::with_capacity(count * dimension)`. `usize::MAX >> 2` is 2^62
+        // natively and 2^30 on wasm32, so the test compiles on both.
+        for dimension in [usize::MAX, usize::MAX >> 2, 1 << 30, 2, 0] {
+            let index = old_index(
+                vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+                vec!["a", "b"],
+                dimension,
+            );
+            let bytes = gzip(&bincode::serialize(&index).expect("bincode"));
+            assert!(read(&bytes).is_err(), "dimension {dimension}");
+        }
+    }
+
+    #[test]
+    fn legacy_inflate_is_capped() {
+        let bytes = gzip(&vec![0u8; 1 << 20]);
+        assert!(inflate_capped(&bytes, 1 << 10).is_err());
+        assert_eq!(
+            inflate_capped(&bytes, 1 << 20).expect("within cap").len(),
+            1 << 20
+        );
+    }
+
+    #[test]
+    fn imports_legacy_duplicate_ids_without_shifting() {
+        // The pre-0.1 engine never checked ids, so its snapshots can repeat
+        // one. The parser passes them through; the engine keeps the first.
+        let index = old_index(
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]],
+            vec!["a", "a", "b"],
+            2,
+        );
+        let bytes = gzip(&bincode::serialize(&index).expect("bincode"));
+        let snapshot = read(&bytes).expect("legacy import");
+        assert_eq!(snapshot.ids, vec!["a", "a", "b"]);
+
+        let engine =
+            crate::engine::Engine::from_snapshot(snapshot, Default::default()).expect("load");
+        assert_eq!(engine.len(), 2);
+        // `b` must still own `[-1, 0]`. Before the fix it was shifted onto the
+        // duplicate's `[0, 1]`, one unit of cosine distance away.
+        let hit = &engine.search(&[-1.0, 0.0], 1).neighbors[0];
+        assert_eq!(hit.id, "b");
+        assert!(
+            hit.distance.abs() < 1e-6,
+            "b is at distance {}",
+            hit.distance
+        );
     }
 }

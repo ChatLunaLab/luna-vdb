@@ -56,11 +56,19 @@ rsync -az --delete "${RSYNC_EXCLUDES[@]}" ./ "$REMOTE:$REMOTE_DIR/"
 # Run inside the container. `CARGO_HOME` and `CARGO_TARGET_DIR` point at a
 # persistent volume so dependency compilation is not repeated on every
 # invocation — that is the difference between ~20 s and ~3 min per run.
+#
+# ssh joins its arguments with spaces and the remote shell re-parses the
+# result, so every argument is quoted with `printf %q` first. Passing them
+# bare — as this script used to — split `RUSTFLAGS=-D warnings` into two
+# words (docker then tried to pull an image called "warnings"), and every `;`
+# in the container command ended the `sh -c` early, running the rest on the
+# bare host instead of in the container.
 run_in_container() {
   local rflags="$1"
   shift
 
-  ssh "$REMOTE" docker run --rm \
+  local remote
+  remote="$(printf '%q ' docker run --rm \
     -v "$REMOTE_DIR:/work" \
     -v "luna-cargo-registry:/usr/local/cargo/registry" \
     -v "luna-cargo-git:/usr/local/cargo/git" \
@@ -69,7 +77,9 @@ run_in_container() {
     -e "RUSTFLAGS=$rflags" \
     -e CARGO_TERM_COLOR=always \
     "$PINNED_IMAGE" \
-    sh -c "$*"
+    sh -c "$*")"
+
+  ssh "$REMOTE" "$remote"
 }
 
 case "$MODE" in
@@ -99,22 +109,21 @@ case "$MODE" in
 
   bench)
     log "cargo bench on $PINNED_IMAGE"
-    # Pinning the CPU matters: a benchmark on a shared host measures the host.
-    # `taskset` restricts to 4 cores so the flat scan and the index see the same
-    # cache budget.
+    # Output goes to a file first so a failed build exits non-zero instead of
+    # being masked by `tail` at the end of a pipe.
     run_in_container "-D warnings" \
-      'set -e; cargo bench --bench search 2>&1 | tail -60'
+      'set -e; cargo bench --bench search > /tmp/bench.txt 2>&1 || { tail -60 /tmp/bench.txt; exit 1; }; tail -60 /tmp/bench.txt'
     ;;
 
   shell)
     log "opening a shell in $PINNED_IMAGE"
-    ssh -t "$REMOTE" docker run --rm -it \
+    ssh -t "$REMOTE" "$(printf '%q ' docker run --rm -it \
       -v "$REMOTE_DIR:/work" \
       -v "luna-cargo-registry:/usr/local/cargo/registry" \
       -v "luna-target:/work/target" \
       -w /work \
       "$PINNED_IMAGE" \
-      sh
+      sh)"
     ;;
 
   *)

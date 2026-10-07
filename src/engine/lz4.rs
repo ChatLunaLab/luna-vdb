@@ -171,11 +171,38 @@ pub fn compress(src: &[u8]) -> Vec<u8> {
     dst
 }
 
+/// Upper bound on what `src_len` compressed bytes can expand to.
+///
+/// Every input byte of an LZ4 block yields at most 255 output bytes (a run of
+/// `0xFF` length-extension bytes, each worth 255), plus a constant for the
+/// token. Used to reject a declared size before allocating it.
+pub fn decompress_bound(src_len: usize) -> usize {
+    src_len.saturating_mul(255).saturating_add(64)
+}
+
 /// Decompress a block. `expected_len` is the exact original size, which the
 /// caller knows from the envelope — this lets us allocate once instead of
 /// growing, and lets us reject a truncated block before copying anything.
+///
+/// `expected_len` comes from a header field, so it is never trusted for an
+/// allocation: it is first checked against what `src` could possibly expand
+/// to, and the buffer is then reserved with `try_reserve_exact`, so an
+/// impossible size is an error rather than a capacity-overflow panic (which
+/// on wasm32 traps the whole instance) or an abort.
 pub fn decompress(src: &[u8], expected_len: usize) -> EngineResult<Vec<u8>> {
-    let mut dst: Vec<u8> = Vec::with_capacity(expected_len);
+    if expected_len > decompress_bound(src.len()) {
+        return Err(EngineError::corrupt(format!(
+            "lz4: {} compressed bytes cannot expand to the declared {expected_len}",
+            src.len()
+        )));
+    }
+
+    let mut dst: Vec<u8> = Vec::new();
+    dst.try_reserve_exact(expected_len).map_err(|_| {
+        EngineError::new(format!(
+            "lz4: cannot allocate {expected_len} bytes for the decompressed snapshot"
+        ))
+    })?;
     let mut pos = 0usize;
 
     if expected_len == 0 {
@@ -196,7 +223,9 @@ pub fn decompress(src: &[u8], expected_len: usize) -> EngineResult<Vec<u8>> {
                     .get(pos)
                     .ok_or_else(|| EngineError::corrupt("lz4: truncated literal length"))?;
                 pos += 1;
-                literal_len += byte as usize;
+                literal_len = literal_len
+                    .checked_add(byte as usize)
+                    .ok_or_else(|| EngineError::corrupt("lz4: literal length overflow"))?;
                 if byte != 255 {
                     break;
                 }
@@ -210,7 +239,7 @@ pub fn decompress(src: &[u8], expected_len: usize) -> EngineResult<Vec<u8>> {
             let literals = src
                 .get(pos..end)
                 .ok_or_else(|| EngineError::corrupt("lz4: truncated literals"))?;
-            if dst.len() + literals.len() > expected_len {
+            if literals.len() > expected_len - dst.len() {
                 return Err(EngineError::corrupt("lz4: output exceeds declared size"));
             }
             dst.extend_from_slice(literals);
@@ -240,16 +269,23 @@ pub fn decompress(src: &[u8], expected_len: usize) -> EngineResult<Vec<u8>> {
                     .get(pos)
                     .ok_or_else(|| EngineError::corrupt("lz4: truncated match length"))?;
                 pos += 1;
-                match_len += byte as usize;
+                match_len = match_len
+                    .checked_add(byte as usize)
+                    .ok_or_else(|| EngineError::corrupt("lz4: match length overflow"))?;
                 if byte != 255 {
                     break;
                 }
             }
         }
-        match_len += MIN_MATCH;
+        match_len = match_len
+            .checked_add(MIN_MATCH)
+            .ok_or_else(|| EngineError::corrupt("lz4: match length overflow"))?;
 
         let mut src_pos = dst.len() - offset;
-        if dst.len() + match_len > expected_len {
+        // Written as a subtraction: `dst.len() + match_len` can wrap on wasm32
+        // for a crafted length, slip under the limit, and panic in `reserve`.
+        // `dst.len() <= expected_len` holds throughout, so this cannot wrap.
+        if match_len > expected_len - dst.len() {
             return Err(EngineError::corrupt("lz4: output exceeds declared size"));
         }
 
@@ -333,6 +369,31 @@ mod tests {
         assert!(decompress(&[0x40, b'a', b'b', 0x00, 0x00, 0x00], 100).is_err());
         // Declared length larger than what the stream produces.
         assert!(decompress(&[0x40, b'a', b'b'], 99).is_err());
+    }
+
+    #[test]
+    fn rejects_impossible_declared_sizes_without_allocating() {
+        // REGRESSION: the declared size was reserved before anything was
+        // read, so a 16-byte header claiming 4 GiB trapped a wasm instance.
+        assert!(decompress(&[], usize::MAX).is_err());
+        assert!(decompress(&[0x10, b'x'], 1 << 30).is_err());
+        assert!(decompress(&[0u8; 4], decompress_bound(4) + 1).is_err());
+    }
+
+    #[test]
+    fn rejects_overflowing_length_extensions() {
+        // A literal run whose extension bytes sum past the declared size must
+        // be rejected by the size check, never wrap around it.
+        let mut src = vec![0xF0];
+        src.extend(std::iter::repeat_n(0xFFu8, 1000));
+        src.push(0x00);
+        assert!(decompress(&src, 64).is_err());
+
+        // Same for a match length.
+        let mut src = vec![0x4F, b'a', b'b', b'c', b'd', 0x01, 0x00];
+        src.extend(std::iter::repeat_n(0xFFu8, 1000));
+        src.push(0x00);
+        assert!(decompress(&src, 64).is_err());
     }
 
     #[test]

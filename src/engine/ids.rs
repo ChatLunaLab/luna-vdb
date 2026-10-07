@@ -183,30 +183,38 @@ impl IdMap {
             .filter_map(|(row, slot)| slot.as_deref().map(|id| (row as u32, id)))
     }
 
-    /// Rebuild the map after tombstones are removed. `mapping[old_row]` is the
-    /// new row, or `None` if the old row was dead.
+    /// Renumber rows. `mapping[old_row]` is the new row, or `None` to drop it.
     ///
-    /// The returned id list is in new-row order and is what the snapshot writes.
-    pub fn compact(&mut self, mapping: &[Option<u32>]) -> Vec<String> {
-        let mut buckets: HashMap<u64, Bucket> = HashMap::with_capacity(self.buckets.len());
-        let mut rows: Vec<Option<String>> = Vec::with_capacity(self.live);
-        let mut all_ids: Vec<String> = Vec::with_capacity(self.live);
+    /// The mapping may reorder as well as drop — the engine uses it both to
+    /// squeeze out tombstones and to lay rows out cell by cell after training —
+    /// so the new rows are placed by index rather than by iteration order. The
+    /// new row numbers must be exactly `0..n` for the `n` rows kept.
+    pub fn compact(&mut self, mapping: &[Option<u32>]) {
+        let kept = mapping.iter().flatten().count();
+        let mut rows: Vec<Option<String>> = vec![None; kept];
 
-        for (old_row, slot) in self.rows.iter().enumerate() {
-            let (Some(id), Some(Some(new_row))) = (slot.as_deref(), mapping.get(old_row)) else {
+        for (old_row, slot) in self.rows.iter_mut().enumerate() {
+            let Some(Some(new_row)) = mapping.get(old_row) else {
                 continue;
             };
+            if let Some(target) = rows.get_mut(*new_row as usize) {
+                *target = slot.take();
+            }
+        }
 
-            let hash = hash_str(id);
-            buckets.entry(hash).or_default().push((hash, *new_row));
-            all_ids.push(id.to_string());
-            rows.push(Some(id.to_string()));
+        let mut buckets: HashMap<u64, Bucket> = HashMap::with_capacity(kept);
+        let mut live = 0usize;
+        for (row, slot) in rows.iter().enumerate() {
+            if let Some(id) = slot {
+                let hash = hash_str(id);
+                buckets.entry(hash).or_default().push((hash, row as u32));
+                live += 1;
+            }
         }
 
         self.buckets = buckets;
         self.rows = rows;
-        self.live = all_ids.len();
-        all_ids
+        self.live = live;
     }
 
     pub fn clear(&mut self) {
@@ -216,12 +224,18 @@ impl IdMap {
     }
 
     /// Replace the entire contents. Used by the snapshot loader.
+    ///
+    /// Produces exactly one row slot per input id, so row `i` here is always
+    /// vector `i` in the snapshot. A repeated id — which the pre-1.0 engine
+    /// could write, since it never checked — keeps its first occurrence and
+    /// turns the later ones into tombstones. Skipping them instead, which is
+    /// what this used to do, shifted every later id onto the previous row's
+    /// vector.
     pub fn from_ids(ids: Vec<String>) -> Self {
         let mut map = Self::with_capacity(ids.len());
         for id in ids {
-            // Duplicates in a snapshot would be a writer bug; keep the first
-            // and drop the rest rather than failing the whole load.
             if map.contains(&id) {
+                map.rows.push(None);
                 continue;
             }
             let hash = hash_str(&id);
@@ -283,9 +297,8 @@ mod tests {
 
         // Old rows: a=0, b=1(dead), c=2, d=3 → new: a=0, c=1, d=2
         let mapping = vec![Some(0u32), None, Some(1), Some(2)];
-        let ids = map.compact(&mapping);
+        map.compact(&mapping);
 
-        assert_eq!(ids, vec!["a", "c", "d"]);
         assert_eq!(map.len(), 3);
         assert_eq!(map.dead(), 0);
         assert_eq!(map.get("a"), Some(0));
@@ -339,9 +352,31 @@ mod tests {
     }
 
     #[test]
-    fn from_ids_drops_duplicates() {
+    fn compaction_can_reorder() {
+        let mut map = IdMap::new();
+        for id in ["a", "b", "c"] {
+            map.insert(id.to_string()).expect("insert");
+        }
+
+        // A permutation, not just a squeeze: c=0, a=1, b=2.
+        map.compact(&[Some(1), Some(2), Some(0)]);
+
+        assert_eq!(map.get("c"), Some(0));
+        assert_eq!(map.get("a"), Some(1));
+        assert_eq!(map.get("b"), Some(2));
+        assert_eq!(map.id_of(0), Some("c"));
+        assert_eq!(map.dead(), 0);
+    }
+
+    #[test]
+    fn from_ids_tombstones_duplicates_in_place() {
+        // One slot per input id, so `y` stays on row 2 — its vector's row.
         let map = IdMap::from_ids(vec!["x".into(), "x".into(), "y".into()]);
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get("y"), Some(1));
+        assert_eq!(map.slots(), 3);
+        assert_eq!(map.dead(), 1);
+        assert_eq!(map.get("x"), Some(0));
+        assert_eq!(map.get("y"), Some(2));
+        assert_eq!(map.id_of(1), None);
     }
 }

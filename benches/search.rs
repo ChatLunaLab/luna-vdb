@@ -8,14 +8,17 @@
 //! It reports, for each corpus size:
 //!
 //! * `flat` — brute force over the flat arena with SIMD kernels. This is the
-//!   *new* baseline and it is already much faster than the old engine, because
-//!   the old engine's scan was scalar and scattered.
-//! * `ivf` — the full IVF + PQ pipeline.
-//! * `ivf_exact` — IVF with exact rescoring (no PQ approximation).
+//!   reference: its recall is 1.0 by definition, because the ground truth is
+//!   computed with it.
+//! * `default` — `Engine::search` with default options: the IVF-pruned exact
+//!   search. Its recall must also print as 1.0; anything else is a bug.
+//! * `approx` — the same index in approximate mode (fixed `nprobe`), to show
+//!   what the opt-in trade buys on this data.
 //!
-//! and `exact` recall of both against `flat`, so the speed number can be read
-//! together with the quality number. A speedup without the recall is not a
-//! speedup.
+//! The corpus is uniform random, which has no cluster structure — the worst
+//! case for any partitioning index, so `default` gains least here. See
+//! `compare/src/sweep.rs` for clustered data, and `compare/src/main.rs` for
+//! the comparison against the pre-rewrite engine.
 //!
 //! `harness = false` (see `Cargo.toml`) because these are throughput
 //! measurements with a fixed iteration count, not statistically-tested
@@ -164,7 +167,7 @@ fn main() {
                 &truth,
             );
 
-            let ivf = measure(
+            let default = measure(
                 |query, k| {
                     engine
                         .search(&queries[query], k)
@@ -176,13 +179,28 @@ fn main() {
                 &truth,
             );
 
-            let speedup = flat.mean.as_secs_f64() / ivf.mean.as_secs_f64().max(f64::MIN_POSITIVE);
+            let mut approximate = engine.clone();
+            approximate.set_approximate(true);
+            let approx = measure(
+                |query, k| {
+                    approximate
+                        .search(&queries[query], k)
+                        .neighbors
+                        .into_iter()
+                        .map(|neighbor| neighbor.id)
+                        .collect()
+                },
+                &truth,
+            );
+
+            let speedup = |m: &Measurement| {
+                flat.mean.as_secs_f64() / m.mean.as_secs_f64().max(f64::MIN_POSITIVE)
+            };
 
             println!(
-                "dim {dim:>5}  n {size:>7}  nlist {:>5}  nprobe {:>4}  pq {:>5}",
+                "dim {dim:>5}  n {size:>7}  nlist {:>5}  nprobe {:>4}",
                 engine.nlist(),
                 engine.nprobe(),
-                engine.has_pq(),
             );
             println!(
                 "    flat      {:>10.3} ms  p50 {:>10.3} ms  recall {:.3}",
@@ -191,30 +209,31 @@ fn main() {
                 flat.recall,
             );
             println!(
-                "    ivf       {:>10.3} ms  p50 {:>10.3} ms  recall {:.3}   {speedup:>6.1}x vs flat",
-                ms(ivf.mean),
-                ms(ivf.p50),
-                ivf.recall,
+                "    default   {:>10.3} ms  p50 {:>10.3} ms  recall {:.3}   {:>6.1}x vs flat",
+                ms(default.mean),
+                ms(default.p50),
+                default.recall,
+                speedup(&default),
+            );
+            println!(
+                "    approx    {:>10.3} ms  p50 {:>10.3} ms  recall {:.3}   {:>6.1}x vs flat",
+                ms(approx.mean),
+                ms(approx.p50),
+                approx.recall,
+                speedup(&approx),
             );
 
-            // Where the time actually goes on the approximate path.
             let outcome = engine.search(&queries[0], K);
             println!(
-                "    scanned {} of {} rows ({:.1}%), rescored {}",
+                "    default scanned {} of {} rows ({:.1}%) in {} cells",
                 outcome.candidates_scored,
                 size,
                 100.0 * outcome.candidates_scored as f64 / size as f64,
-                outcome.rescored,
+                outcome.cells_probed,
             );
             println!();
         }
     }
-
-    println!("Note: `speedup vs flat` compares the index against luna-vdb's own");
-    println!("vectorised flat scan, not against the pre-0.1 engine. The pre-0.1");
-    println!("scan was scalar over a per-vector heap layout, which the kernel and");
-    println!("arena changes alone already improve by a large factor before the");
-    println!("index is involved.");
 }
 
 fn ms(duration: Duration) -> f64 {

@@ -1,28 +1,26 @@
 //! Recall/latency sweep for the new engine, on two kinds of data.
 //!
-//! The comparison binary showed that on *uniform random* vectors the default
-//! IVF path returns 2–10% recall: with no cluster structure the true
-//! neighbours are spread evenly over the cells, so probing 5% of the cells
-//! finds about 5% of them. That is a property of the data as much as of the
-//! index — uniform random vectors in hundreds of dimensions have no
-//! neighbourhood structure for any partitioning index to exploit — but real
-//! embeddings are strongly clustered, and a fair verdict needs both.
+//! For each dataset and size it prints:
 //!
-//! So this sweeps, for each dataset and size:
+//! * the brute-force scan (the reference, recall 1.0 by definition),
+//! * the default search — exact, IVF-pruned — with how many rows it scanned,
+//! * approximate mode across `nprobe`, with exact scoring of every probed row
+//!   ("ivf-flat") and with the PQ prefilter ("ivf-pq").
 //!
-//! * the exact SIMD scan (the reference, recall 1.0 by definition),
-//! * IVF with exact rescoring of every probed row ("IVF-Flat"),
-//! * IVF with the PQ prefilter (the current default),
+//! Two datasets, because the answer depends on them: uniform random vectors
+//! have no neighbourhood structure for any partitioning index to exploit, so
+//! the pruned search scans most rows and the approximate one has low recall;
+//! an overlapping Gaussian mixture is much closer to real text embeddings.
 //!
-//! across `nprobe`, and prints recall@10 and latency side by side. `nprobe` is
-//! changed with `Engine::set_nprobe` on one built index, so each curve costs a
-//! single build.
+//! The `cells` column is the number of cells actually probed, averaged over
+//! the queries — the effective probe count, which can exceed the requested
+//! `nprobe` because the engine probes at least `k / 4` cells.
 
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use luna_vdb::engine::{Engine, IndexOptions};
+use luna_vdb::engine::{Engine, IndexOptions, SearchOutcome};
 
 const K: usize = 10;
 const QUERIES: usize = 100;
@@ -90,7 +88,13 @@ impl Data {
 
 /// Corpus and queries drawn from the same distribution, so a query is a new
 /// point "about" one of the corpus's topics, not a copy of a stored row.
-fn generate(data: Data, count: usize, queries: usize, dim: usize, seed: u64) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+fn generate(
+    data: Data,
+    count: usize,
+    queries: usize,
+    dim: usize,
+    seed: u64,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let mut rng = Rng::new(seed);
     match data {
         Data::Uniform => {
@@ -116,7 +120,10 @@ fn generate(data: Data, count: usize, queries: usize, dim: usize, seed: u64) -> 
                 (0..n)
                     .map(|_| {
                         let pick = ((rng.unit() * centres_n as f32) as usize).min(centres_n - 1);
-                        centres[pick].iter().map(|c| c + sigma * rng.normal()).collect()
+                        centres[pick]
+                            .iter()
+                            .map(|c| c + sigma * rng.normal())
+                            .collect()
                     })
                     .collect()
             };
@@ -127,109 +134,162 @@ fn generate(data: Data, count: usize, queries: usize, dim: usize, seed: u64) -> 
     }
 }
 
-fn measure(queries: &[Vec<f32>], truth: &[HashSet<String>], mut search: impl FnMut(&[f32]) -> Vec<String>) -> (Duration, f64) {
+struct Measured {
+    latency: Duration,
+    recall: f64,
+    scanned: f64,
+    cells: f64,
+}
+
+fn measure(
+    queries: &[Vec<f32>],
+    truth: &[HashSet<String>],
+    mut search: impl FnMut(&[f32]) -> SearchOutcome,
+) -> Measured {
     for query in queries.iter().take(5) {
         black_box(search(query));
     }
     let mut total = Duration::ZERO;
     let mut hits = 0usize;
+    let mut scanned = 0usize;
+    let mut cells = 0usize;
     for (query, expected) in queries.iter().zip(truth) {
         let started = Instant::now();
-        let found = black_box(search(query));
+        let outcome = black_box(search(query));
         total += started.elapsed();
-        hits += found.iter().filter(|id| expected.contains(id.as_str())).count();
+        hits += outcome
+            .neighbors
+            .iter()
+            .filter(|n| expected.contains(n.id.as_str()))
+            .count();
+        scanned += outcome.candidates_scored;
+        cells += outcome.cells_probed;
     }
-    (
-        total / queries.len() as u32,
-        hits as f64 / (queries.len() * K) as f64,
-    )
+    let n = queries.len() as f64;
+    Measured {
+        latency: total / queries.len() as u32,
+        recall: hits as f64 / (queries.len() * K) as f64,
+        scanned: scanned as f64 / n,
+        cells: cells as f64 / n,
+    }
 }
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
-fn ids_of(engine: &Engine, query: &[f32], exact: bool) -> Vec<String> {
-    let outcome = if exact {
-        engine.search_exact(query, K)
-    } else {
-        engine.search(query, K)
-    };
-    outcome.neighbors.into_iter().map(|n| n.id).collect()
-}
-
 fn main() {
     println!("luna-vdb recall/latency sweep");
-    println!("kernel: {}, queries: {QUERIES}, k: {K}", luna_vdb::simd_backend());
+    println!(
+        "kernel: {}, queries: {QUERIES}, k: {K}",
+        luna_vdb::simd_backend()
+    );
 
     for data in [Data::Clustered, Data::Uniform] {
         for &(dim, size) in &CASES {
-            let seed = splitmix((dim as u64) << 40 ^ size as u64 ^ data as u64);
+            let seed = splitmix(((dim as u64) << 40) ^ size as u64 ^ data as u64);
             let (corpus, queries) = generate(data, size, QUERIES, dim, seed);
             let ids: Vec<String> = (0..size).map(|i| format!("v{i}")).collect();
 
             println!("\n== {} dim {dim} n {size}", data.name());
 
-            let flat_options = IndexOptions {
-                ivf_threshold: usize::MAX,
-                ..IndexOptions::default()
-            };
-            let flat = match Engine::build(&corpus, &ids, flat_options) {
+            let started = Instant::now();
+            let mut engine = match Engine::build(&corpus, &ids, IndexOptions::default()) {
                 Ok(engine) => engine,
                 Err(error) => {
-                    println!("   flat build failed: {error}");
+                    println!("   build failed: {error}");
                     continue;
                 }
             };
+            let build = started.elapsed();
+
             let truth: Vec<HashSet<String>> = queries
                 .iter()
-                .map(|q| ids_of(&flat, q, true).into_iter().collect())
+                .map(|q| {
+                    engine
+                        .search_exact(q, K)
+                        .neighbors
+                        .into_iter()
+                        .map(|n| n.id)
+                        .collect()
+                })
                 .collect();
-            let (flat_latency, _) = measure(&queries, &truth, |q| ids_of(&flat, q, true));
-            println!("   exact scan                 {:>9.4} ms   recall 1.000", ms(flat_latency));
-            drop(flat);
 
-            for (label, exact_rescore_only) in [("ivf-flat", true), ("ivf-pq  ", false)] {
-                let options = IndexOptions {
-                    exact_rescore_only,
+            let flat = measure(&queries, &truth, |q| engine.search_exact(q, K));
+            println!(
+                "   exact scan               {:>9.4} ms   recall {:.3}",
+                ms(flat.latency),
+                flat.recall
+            );
+
+            let pruned = measure(&queries, &truth, |q| engine.search(q, K));
+            println!(
+                "   default (exact, pruned)  {:>9.4} ms   recall {:.3}   {:>6.1}x vs scan   scanned {:>8.0} rows in {:>5.1} cells   build {:.0} ms, nlist {}",
+                ms(pruned.latency),
+                pruned.recall,
+                flat.latency.as_secs_f64() / pruned.latency.as_secs_f64().max(1e-12),
+                pruned.scanned,
+                pruned.cells,
+                ms(build),
+                engine.nlist(),
+            );
+
+            engine.set_approximate(true);
+            sweep("ivf-flat", &mut engine, &queries, &truth, flat.latency);
+
+            let started = Instant::now();
+            let mut pq = match Engine::build(
+                &corpus,
+                &ids,
+                IndexOptions {
+                    exact_rescore_only: false,
+                    approximate: true,
                     ..IndexOptions::default()
-                };
-                let started = Instant::now();
-                let mut engine = match Engine::build(&corpus, &ids, options) {
-                    Ok(engine) => engine,
-                    Err(error) => {
-                        println!("   {label} build failed: {error}");
-                        continue;
-                    }
-                };
-                let build = started.elapsed();
-                println!(
-                    "   {label} build {:>9.1} ms  nlist {}  default nprobe {}  pq {}",
-                    ms(build),
-                    engine.nlist(),
-                    engine.nprobe(),
-                    engine.has_pq(),
-                );
-
-                let mut last = 0;
-                for &nprobe in &NPROBES {
-                    if nprobe > engine.nlist() || engine.nlist() == 0 {
-                        break;
-                    }
-                    engine.set_nprobe(nprobe);
-                    if engine.nprobe() == last {
-                        continue;
-                    }
-                    last = engine.nprobe();
-                    let (latency, recall) = measure(&queries, &truth, |q| ids_of(&engine, q, false));
-                    println!(
-                        "   {label} nprobe {:>4}   {:>9.4} ms   recall {recall:.3}   {:>6.1}x vs exact",
-                        nprobe,
-                        ms(latency),
-                        flat_latency.as_secs_f64() / latency.as_secs_f64().max(1e-12),
-                    );
+                },
+            ) {
+                Ok(engine) => engine,
+                Err(error) => {
+                    println!("   pq build failed: {error}");
+                    continue;
                 }
-            }
+            };
+            println!(
+                "   ivf-pq build {:.0} ms, pq {}",
+                ms(started.elapsed()),
+                pq.has_pq()
+            );
+            sweep("ivf-pq  ", &mut pq, &queries, &truth, flat.latency);
         }
+    }
+}
+
+fn sweep(
+    label: &str,
+    engine: &mut Engine,
+    queries: &[Vec<f32>],
+    truth: &[HashSet<String>],
+    reference: Duration,
+) {
+    let mut last = 0usize;
+    for &nprobe in &NPROBES {
+        if nprobe > engine.nlist() {
+            break;
+        }
+        engine.set_nprobe(nprobe);
+        let m = measure(queries, truth, |q| engine.search(q, K));
+        // Requests below the engine's `k / 4` floor probe the same cells;
+        // print each effective configuration once.
+        let effective = m.cells.round() as usize;
+        if effective == last {
+            continue;
+        }
+        last = effective;
+        println!(
+            "   {label} cells {:>6.1}   {:>9.4} ms   recall {:.3}   {:>6.1}x vs scan",
+            m.cells,
+            ms(m.latency),
+            m.recall,
+            reference.as_secs_f64() / m.latency.as_secs_f64().max(1e-12),
+        );
     }
 }

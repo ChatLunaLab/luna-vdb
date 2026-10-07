@@ -13,7 +13,9 @@
 //!   against the new LZ4+CRC format.
 //!
 //! and separately the incremental-ingest cost, where the old engine retrained
-//! its whole index on every `add`.
+//! its whole index on every `add`. Each case also imports the old engine's
+//! snapshot into the new engine and checks the answers match; a mismatch exits
+//! non-zero.
 //!
 //! Both engines receive the query as an owned `Vec<f32>`, because that is what
 //! the JS bindings hand them; the copy is inside the timed region for both.
@@ -231,6 +233,26 @@ fn main() {
         // -- snapshot ------------------------------------------------------
         let (old_bytes, old_save) = timed(|| old_db.serialize());
         let old_len = old_bytes.len();
+
+        // The new engine must import what the old one wrote, and answer the
+        // same queries identically once it has. Checked on every case so the
+        // legacy path is exercised at the sizes people actually have.
+        let (imported, import_time) = timed(|| new_engine::load(&old_bytes));
+        let import_ok = match &imported {
+            Ok(engine) => {
+                engine.len() == size
+                    && queries.iter().take(10).all(|q| {
+                        engine.search(q, K).neighbors == new_db.search_exact(q, K).neighbors
+                    })
+            }
+            Err(_) => false,
+        };
+        if !import_ok {
+            println!("dim {dim} n {size}: importing the old engine's snapshot failed or disagreed");
+            std::process::exit(1);
+        }
+        drop(imported);
+
         let (old_restored, old_load) = timed(|| OldDb::deserialize(old_bytes));
         black_box(old_restored.size());
 
@@ -293,6 +315,10 @@ fn main() {
             ms(old_load),
             ms(new_load),
             ratio(old_load, new_load),
+        );
+        println!(
+            "  legacy import of the old snapshot: {:.2} ms, answers identical",
+            ms(import_time),
         );
         println!();
 

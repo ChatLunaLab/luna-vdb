@@ -492,21 +492,56 @@ fn corrupt_snapshots_error_without_poisoning() {
     assert!(load(&good).is_ok());
 }
 
+/// Bitwise CRC-32 (IEEE), independent of the crate's table-driven one, so the
+/// test builds a *valid* envelope without trusting the code under test.
+fn crc32_ieee(seed: u32, data: &[u8]) -> u32 {
+    let mut crc = !seed;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 #[test]
 fn oversized_declared_length_is_rejected() {
-    // A header claiming a 4 GiB payload with nothing behind it. This must fail
-    // on the length check rather than attempting the allocation — the old code
-    // would have tried, and been OOM-killed on a wasm host with a hard 4 GiB
-    // ceiling.
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"LVD2");
-    bytes.extend_from_slice(&2u16.to_le_bytes()); // version
-    bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
-    bytes.extend_from_slice(&(4u32 << 30).to_le_bytes()); // raw_len
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // crc
-    bytes.extend_from_slice(&[0u8; 16]);
+    // REGRESSION: this test used to declare `4u32 << 30` — which is 0 — next
+    // to an all-zero CRC, so it passed on the checksum and never exercised a
+    // length. It now builds headers whose checksum is *valid*, so only the
+    // length handling stands between them and a 4 GiB reservation.
+    for flags in [0u16, 1] {
+        for raw_len in [u32::MAX, 1 << 31, 1 << 30] {
+            for stored in [&[][..], &[0x10, b'x'][..], &[0u8; 16][..]] {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(b"LVD2");
+                bytes.extend_from_slice(&2u16.to_le_bytes());
+                bytes.extend_from_slice(&flags.to_le_bytes());
+                bytes.extend_from_slice(&raw_len.to_le_bytes());
+                let crc = crc32_ieee(crc32_ieee(0, &bytes[4..12]), stored);
+                bytes.extend_from_slice(&crc.to_le_bytes());
+                bytes.extend_from_slice(stored);
 
-    assert!(load(&bytes).is_err());
+                assert!(load(&bytes).is_err(), "flags {flags} raw_len {raw_len}");
+            }
+        }
+    }
+}
+
+#[test]
+fn header_bit_flips_are_caught() {
+    let engine = build(&corpus(50, 8, 0x5), &ids_of(50, "v"), fast());
+    let good = engine.serialize(true).expect("serialize");
+    for offset in 4..16 {
+        let mut bad = good.clone();
+        bad[offset] ^= 0x01;
+        assert!(load(&bad).is_err(), "flip at header byte {offset}");
+    }
 }
 
 #[test]
@@ -587,7 +622,15 @@ fn distance_parsing() {
 
 #[test]
 fn approximate_search_does_less_work_than_exact() {
-    let engine = build(&corpus(3000, 32, 0xABC), &ids_of(3000, "v"), fast());
+    let engine = build(
+        &corpus(3000, 32, 0xABC),
+        &ids_of(3000, "v"),
+        IndexOptions {
+            approximate: true,
+            nprobe: Some(4),
+            ..fast()
+        },
+    );
     assert!(engine.is_indexed());
 
     let approx = engine.search(&[0.1; 32], 10);
@@ -602,6 +645,51 @@ fn approximate_search_does_less_work_than_exact() {
     let exact = engine.search_exact(&[0.1; 32], 10);
     assert!(exact.exact);
     assert_eq!(exact.candidates_scored, 3000);
+}
+
+#[test]
+fn default_search_is_exact_and_prunes_on_clustered_data() {
+    // 40 well-separated blobs. The exact search must return exactly the
+    // brute-force answer while touching only a fraction of the rows.
+    let centres = corpus(40, 32, 0xCE17);
+    let noise = corpus(6000, 32, 0x2015E);
+    let data: Vec<Vec<f32>> = noise
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            centres[i % 40]
+                .iter()
+                .zip(n)
+                .map(|(c, e)| c * 4.0 + 0.1 * e)
+                .collect()
+        })
+        .collect();
+    let engine = build(&data, &ids_of(6000, "v"), fast());
+
+    let mut scanned = 0usize;
+    for row in (0..6000).step_by(250) {
+        let fast_result = engine.search(&data[row], 10);
+        let slow_result = engine.search_exact(&data[row], 10);
+        assert!(fast_result.exact);
+        let fast_ids: Vec<&str> = fast_result
+            .neighbors
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        let slow_ids: Vec<&str> = slow_result
+            .neighbors
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(fast_ids, slow_ids, "query row {row}");
+        scanned += fast_result.candidates_scored;
+    }
+
+    let average = scanned / 24;
+    assert!(
+        average < 6000 / 5,
+        "the exact search scanned {average} of 6000 rows on average; it should prune"
+    );
 }
 
 #[test]
@@ -659,8 +747,9 @@ fn approximate_recall_is_high_without_pq() {
         &ids_of(4000, "v"),
         IndexOptions {
             ivf_threshold: 256,
-            exact_rescore_only: true,
-            nprobe: Some(16),
+            approximate: true,
+            nlist: Some(63),
+            nprobe: Some(32),
             ..Default::default()
         },
     );
@@ -679,7 +768,10 @@ fn pq_index_recall_is_acceptable() {
         &ids_of(6000, "v"),
         IndexOptions {
             ivf_threshold: 256,
+            nlist: Some(46),
             nprobe: Some(24),
+            exact_rescore_only: false,
+            approximate: true,
             ..Default::default()
         },
     );
@@ -690,6 +782,17 @@ fn pq_index_recall_is_acceptable() {
     let measured = recall(&engine, &queries, 10);
 
     assert!(measured > 0.5, "PQ recall was {measured}");
+}
+
+#[test]
+fn default_recall_is_perfect() {
+    // No approximation by default: recall against the brute-force answer is
+    // exactly 1 on unstructured data too, where probing a fraction of the
+    // cells used to find a fraction of the neighbours.
+    let data = corpus(5000, 48, 0xF1A7);
+    let engine = build(&data, &ids_of(5000, "v"), fast());
+    let queries = corpus(30, 48, 0x0E);
+    assert_eq!(recall(&engine, &queries, 10), 1.0);
 }
 
 // ---------------------------------------------------------------------------

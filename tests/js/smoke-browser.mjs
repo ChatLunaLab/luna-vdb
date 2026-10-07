@@ -95,29 +95,41 @@ await test('scalar module is loadable through its ESM entry point', async () => 
   // `--target web` emits an `init` function that must be awaited before the
   // handle is usable; if the packaging dropped it, every consumer breaks.
   assert.equal(typeof module.default, 'function', 'expected a default init export')
-  await module.default(await readFile(path.join(pkgRoot, 'web-scalar', 'luna_vdb_bg.wasm')))
+  await module.default({
+    module_or_path: await readFile(path.join(pkgRoot, 'web-scalar', 'luna_vdb_bg.wasm')),
+  })
 
   assert.equal(typeof module.LunaVDB, 'function')
+  assert.equal(module.simdBackend(), 'scalar')
   const db = new module.LunaVDB()
   assert.equal(db.size(), 0)
 })
 
-await test('simd module passes validation in this runtime', async () => {
+await test('simd module validates and loads through its ESM entry point', async () => {
   const wasmPath = path.join(pkgRoot, 'web', 'luna_vdb_bg.wasm')
   const bytes = await readFile(wasmPath)
 
-  // `WebAssembly.validate` is a real conformance check against the engine's
-  // SIMD support — it is the same gate a browser applies before instantiation.
-  const valid = WebAssembly.validate(bytes)
+  // CI runs Node 22, which supports SIMD128, so a module that fails to
+  // validate here is broken — not "an old runtime". (This used to log a
+  // warning and count as a pass.)
+  assert.ok(WebAssembly.validate(bytes), 'the SIMD build does not validate')
 
-  if (!valid) {
-    // Not necessarily a failure: this Node build may lack SIMD128. Report it
-    // clearly so the difference between "our module is broken" and "this host
-    // is old" is obvious.
-    console.warn(`       (this runtime does not support SIMD128; skipped)`)
-    return
-  }
-  assert.ok(valid)
+  const module = await import(`file://${path.join(pkgRoot, 'web', 'luna_vdb.js')}`)
+  await module.default({ module_or_path: bytes })
+  assert.equal(module.simdBackend(), 'wasm-simd128')
+  const db = new module.LunaVDB()
+  db.add({ embeddings: [{ id: 'a', embeddings: [1, 0] }] })
+  assert.equal(db.search([1, 0], 1).neighbors[0].id, 'a')
+})
+
+await test('node scalar build loads and reports the scalar kernel', async () => {
+  const { createRequire } = await import('node:module')
+  const require = createRequire(import.meta.url)
+  const scalar = require(path.join(pkgRoot, 'nodejs-scalar', 'luna_vdb.js'))
+  assert.equal(scalar.simdBackend(), 'scalar')
+  const db = new scalar.LunaVDB()
+  db.add({ embeddings: [{ id: 'a', embeddings: [1, 0] }] })
+  assert.equal(db.search([1, 0], 1).neighbors[0].id, 'a')
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

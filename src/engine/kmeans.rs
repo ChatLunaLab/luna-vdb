@@ -201,8 +201,17 @@ fn assign_all(
             let dot = simd::dot(point, centroid);
             let dist = point_norm + centroid_norms[c] - 2.0 * dot;
             // A tiny negative from cancellation is fine; clamp so the argmin
-            // is not confused by -0.0 vs 0.0.
-            *slot = if dist > 0.0 { dist } else { 0.0 };
+            // is not confused by -0.0 vs 0.0. A NaN (overflow in the
+            // expansion) must become the *worst* distance: mapping it to 0, as
+            // a plain `dist > 0.0` test does, made the offending centroid win
+            // every argmin and froze training.
+            *slot = if dist.is_nan() {
+                f32::INFINITY
+            } else if dist > 0.0 {
+                dist
+            } else {
+                0.0
+            };
         }
 
         // argmin over the first `k` entries.
@@ -295,12 +304,11 @@ fn seed_plus_plus(
     }
 
     while centroids.len() < k {
-        // Degenerate case: every remaining point coincides with a centre.
-        // Fall back to an arbitrary distinct point.
-        // Written as `<=` rather than `!(total > ...)`: the intent is "no
-        // separated point left", and `<=` also catches a NaN total, which sends
-        // us to the deterministic fallback instead of spinning the loop forever.
-        if total <= f32::MIN_POSITIVE {
+        // Degenerate case: every remaining point coincides with a centre, or
+        // the weights overflowed. Fall back to an arbitrary point. The NaN
+        // test is explicit because `NaN <= x` is false, and a NaN total would
+        // otherwise make every weighted draw fail.
+        if total.is_nan() || total <= f32::MIN_POSITIVE {
             let fallback = (rng.next_f32() * count as f32) as usize;
             let fallback = (fallback.min(count - 1) + centroids.len()) % count;
             centroids.push(points[fallback * dim..fallback * dim + dim].to_vec());

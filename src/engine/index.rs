@@ -1,38 +1,49 @@
-//! The vector index: IVF coarse quantiser + optional PQ prefilter, over a flat
-//! arena.
+//! The vector index: an IVF partition over a flat arena, searched **exactly**
+//! by default, with an opt-in approximate mode.
 //!
-//! # What changed and why it is faster
+//! # Exact by default
 //!
-//! The previous implementation was correct but had four structural problems.
-//! Each one is fixed here, and the fix is noted next to the code that does it.
+//! The default search returns the same neighbours as a brute-force scan. The
+//! IVF cells are used for *pruning*, not for guessing: every cell records the
+//! largest distance from its centroid to any row filed in it (its radius), and
+//! by the triangle inequality no row in a cell can be closer to the query than
+//! `d(query, centroid) - radius`. Cells are visited in order of that lower
+//! bound, and the scan stops at the first cell whose bound is worse than the
+//! current k-th best — every cell after it is provably worse too. Dot product
+//! uses the Cauchy–Schwarz form of the same bound,
+//! `q·x <= q·c + |q|·radius`.
 //!
-//! 1. **`IVF_BUILD_THRESHOLD = 20_000`.** Below twenty thousand vectors the
-//!    index was a full linear scan, with no SIMD. Since almost every consumer of
-//!    a local vector DB sits between a thousand and ten thousand vectors, that
-//!    threshold meant *nobody* got an index. The threshold is now 4 096, and the
-//!    linear path below it is vectorised, so both sides of the boundary are
-//!    fast.
+//! So the speed of a search depends on the data, and its correctness does not.
+//! On clustered data (real embeddings) most cells are pruned; on data with no
+//! structure at all — uniform noise in hundreds of dimensions — the bounds are
+//! loose and the scan degrades towards a full pass, which is still the
+//! vectorised one and still exact. The earlier design probed a fixed fraction
+//! of cells and measured 2–10% recall@10 on unstructured data at its defaults;
+//! a "speedup" bought that way is not one.
 //!
-//! 2. **`add()` retrained the whole index.** `rebuild_ivf_pq` re-ran k-means
-//!    over every vector on every single insert, so an `O(N)` insert made
-//!    ingesting N vectors `O(N²)` — and it cloned the entire arena to do it.
-//!    Insertion now assigns the new vector to its nearest existing centroid and
-//!    appends one code, which is `O(nlist · d)` and independent of `N`.
+//! `IndexOptions::approximate` restores fixed-`nprobe` probing, optionally with
+//! a PQ prefilter, for callers who want to trade recall for latency
+//! explicitly. `SearchOutcome::exact` says which kind of answer came back.
 //!
-//! 3. **Deletion rebuilt the index too.** `remove()` called `swap_remove` and
-//!    then `rebuild_ivf_pq`, so deleting one id cost a full retrain plus a
-//!    rehash of the moved row. Rows are now tombstoned and squeezed out in one
-//!    compaction pass, triggered only when the dead fraction crosses a
-//!    threshold.
+//! # What changed from the pre-1.0 engine
 //!
-//! 4. **The scan was scalar and scattered.** See [`crate::engine::simd`] and
+//! 1. **The scan was scalar and scattered.** See [`crate::engine::simd`] and
 //!    [`crate::engine::types::VectorStore`].
+//! 2. **`add()` retrained the whole index.** `rebuild_ivf_pq` re-ran k-means
+//!    over every vector on every insert, so ingesting N vectors was `O(N²)`.
+//!    Insertion now files the vector in its nearest existing cell, which is
+//!    `O(nlist · d)` and independent of `N`.
+//! 3. **Deletion rebuilt the index too.** Rows are now tombstoned and squeezed
+//!    out in one compaction pass once the dead fraction crosses a threshold.
+//! 4. **Above 20 000 vectors the index returned almost nothing useful.** The
+//!    old IVF-PQ path measured recall@10 of 0.000–0.005 on the comparison
+//!    benchmark (`compare/`); below 20 000 it was an unindexed scalar scan.
 //!
-//! The measured effect is a large multiple over the old engine on
-//! 1k–100k vector workloads; `benches/search.rs` produces the numbers so the
-//! claim can be checked rather than taken on faith.
+//! `compare/` runs this engine against the last pre-rewrite commit on identical
+//! data, so the speedup can be checked rather than taken on faith.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use crate::engine::codec::{self, PqSnapshot, Snapshot};
 use crate::engine::ids::IdMap;
@@ -46,27 +57,33 @@ use crate::engine::types::{Distance, Embedding, EngineError, EngineResult, Vecto
 
 /// Build an IVF index once the corpus reaches this many vectors.
 ///
-/// Was 20 000. Lowered because a flat SIMD scan is fast enough that the
-/// crossover is genuinely around here, and the old value left the majority of
-/// real workloads without an index at all.
+/// Below it a flat SIMD scan is exact, fast — 4 096 × 1536-d is about a
+/// millisecond — and free to build. Above it the pruned search is still exact
+/// and is never meaningfully slower than the flat scan, so the only cost of
+/// indexing early is the k-means run at build time.
 pub const DEFAULT_IVF_THRESHOLD: usize = 4_096;
 
-/// Default coarse cluster count when the caller does not pick one.
-const TARGET_LIST_SIZE: usize = 128;
-
-/// How many cells to probe by default, as a fraction of `nlist`.
+/// Approximate mode only: cells probed by default, as a fraction of `nlist`.
 const DEFAULT_NPROBE_RATIO: f32 = 0.05;
 
-/// Candidates to rescore per requested neighbour. The PQ prefilter is
-/// approximate, so we rescore a multiple of `k` and take the best `k` exactly.
+/// Approximate mode only: never probe fewer cells than this by default.
+const MIN_DEFAULT_NPROBE: usize = 8;
+
+/// Approximate mode with PQ: candidates to rescore per requested neighbour.
+/// The PQ prefilter is approximate, so we rescore a multiple of `k` and take
+/// the best `k` exactly.
 const RESCORE_FACTOR: usize = 8;
 
 /// Minimum candidates to rescore, so small `k` still has slack.
 const MIN_RESCORE_CANDIDATES: usize = 64;
 
 /// Retrain once this fraction of the corpus has been added since the last
-/// training run. Drift degrades recall slowly; this bounds it.
+/// training run. Drift never affects correctness — the radii keep the bounds
+/// valid — but it loosens them, which costs speed.
 const RETRAIN_GROWTH_RATIO: f32 = 0.25;
+
+/// Never retrain for fewer additions than this, however small the corpus.
+const MIN_RETRAIN_GROWTH: usize = 256;
 
 /// Compact once this fraction of rows are tombstones.
 const DEFAULT_COMPACT_RATIO: f32 = 0.3;
@@ -75,9 +92,31 @@ const DEFAULT_COMPACT_RATIO: f32 = 0.3;
 /// to work with per subquantiser.
 const PQ_MIN_VECTORS: usize = 2_048;
 
-/// Cap on training-set size. Training on a sample keeps build time bounded on
-/// large corpora without measurably hurting cluster quality.
+/// Coarse k-means trains on this many points per centroid, not on the whole
+/// corpus. k-means cost is `points × centroids × d × iterations`; training on
+/// every row made `index()` of 50 000 × 1536-d vectors take 20–30 s, while the
+/// quality of the partition stops improving long before that.
+const SAMPLES_PER_CENTROID: usize = 48;
+
+/// Same idea for PQ codebooks, per codeword.
+const PQ_SAMPLES_PER_CODEWORD: usize = 64;
+
+/// Hard cap on any training sample.
 const MAX_TRAINING_SAMPLES: usize = 65_536;
+
+/// Lloyd iterations for both quantisers.
+const KMEANS_ITERATIONS: usize = 10;
+
+/// Relative slack subtracted from every pruning bound.
+///
+/// The bound is `d(q, c) - r`, a difference of two rounded f32 sums, so it
+/// carries an absolute error proportional to `d(q, c) + r`. The worst-case
+/// relative error of an f32 sum of `d` squares, accumulated in four or more
+/// independent lanes, is about `(d / 4) · 2⁻²⁴` — under `1e-4` even at
+/// `d = 4096`. Shrinking the bound by `1e-3` of that sum means rounding can
+/// only make the search scan *more* cells than necessary, never prune one
+/// that holds a true neighbour, at a cost in pruning too small to measure.
+const BOUND_SLACK: f32 = 1e-3;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -88,9 +127,10 @@ const MAX_TRAINING_SAMPLES: usize = 65_536;
 #[derive(Debug, Clone, Copy)]
 pub struct IndexOptions {
     pub distance: Distance,
-    /// Coarse cells. `None` picks `clamp(sqrt(n) / 4, 1, 65_536)`.
+    /// Coarse cells. `None` picks `round(sqrt(n))`.
     pub nlist: Option<usize>,
-    /// Cells probed per query. `None` picks ~5% of `nlist`, at least 1.
+    /// Approximate mode only: cells probed per query. `None` picks ~5% of
+    /// `nlist`, at least 8.
     pub nprobe: Option<usize>,
     /// PQ subquantisers. `None` derives one byte per 8 dimensions, rounded so
     /// `dim % m == 0`.
@@ -103,9 +143,14 @@ pub struct IndexOptions {
     pub retrain_growth_ratio: f32,
     /// Tombstone fraction before compaction.
     pub compact_ratio: f32,
-    /// Disable the PQ prefilter. Exact rescoring then covers every candidate in
-    /// the probed lists, which is slower but has no approximation error.
+    /// `false` trains PQ codes and uses them as a prefilter in approximate
+    /// mode. The default, `true`, skips PQ entirely: no codebook training at
+    /// build time, and every probed row is scored exactly.
     pub exact_rescore_only: bool,
+    /// Probe a fixed `nprobe` cells instead of searching exactly. Faster on
+    /// data with little cluster structure, at the cost of recall; see the
+    /// module docs.
+    pub approximate: bool,
     /// Seed for k-means, so a snapshot is reproducible.
     pub seed: u64,
 }
@@ -121,7 +166,8 @@ impl Default for IndexOptions {
             ivf_threshold: DEFAULT_IVF_THRESHOLD,
             retrain_growth_ratio: RETRAIN_GROWTH_RATIO,
             compact_ratio: DEFAULT_COMPACT_RATIO,
-            exact_rescore_only: false,
+            exact_rescore_only: true,
+            approximate: false,
             seed: 0x5EED_5EED_5EED_5EED,
         }
     }
@@ -143,10 +189,14 @@ impl IndexOptions {
 struct Ivf {
     /// `nlist × dim`, row-major.
     centroids: Vec<f32>,
-    /// Cached squared norms of the centroids, for the distance expansion.
-    centroid_norms: Vec<f32>,
     /// `nlist` lists of row indices. Stale rows stay until compaction.
     lists: Vec<Vec<u32>>,
+    /// Per cell, an upper bound on the L2 distance from the centroid to any
+    /// row ever filed in the cell. Only ever grows between rebuilds, so it
+    /// stays a valid bound after tombstoning; it is recomputed from scratch
+    /// whenever the lists are rebuilt. Not stored in snapshots — it is derived
+    /// data, recomputed on load in one pass.
+    radii: Vec<f32>,
 }
 
 impl Ivf {
@@ -158,22 +208,42 @@ impl Ivf {
         self.lists.is_empty()
     }
 
-    /// Nearest centroid to `vector`, by exact L2.
-    fn nearest_centroid(&self, vector: &[f32], dim: usize) -> usize {
-        let nlist = self.nlist();
-        let mut best = 0usize;
-        let mut best_dist = f32::MAX;
+    fn centroid(&self, cell: usize, dim: usize) -> &[f32] {
+        self.centroids
+            .get(cell * dim..cell * dim + dim)
+            .unwrap_or(&[])
+    }
 
-        for cell in 0..nlist {
-            let centroid = &self.centroids[cell * dim..cell * dim + dim];
-            let dist = simd::l2_sq(vector, centroid);
+    /// Nearest centroid to `vector` by exact L2, and the squared distance to
+    /// it. Ties and NaNs resolve to the lowest cell index.
+    fn nearest_centroid(&self, vector: &[f32], dim: usize) -> (usize, f32) {
+        let mut best = 0usize;
+        let mut best_dist = f32::INFINITY;
+
+        for cell in 0..self.nlist() {
+            let dist = simd::l2_sq(vector, self.centroid(cell, dim));
             if dist < best_dist {
                 best_dist = dist;
                 best = cell;
             }
         }
 
-        best
+        (best, best_dist)
+    }
+
+    /// Record that a row at squared distance `dist_sq` was filed in `cell`.
+    fn widen(&mut self, cell: usize, dist_sq: f32) {
+        if let Some(radius) = self.radii.get_mut(cell) {
+            let dist = dist_sq.sqrt();
+            // A non-finite distance makes the bound useless; `INFINITY` turns
+            // pruning off for this cell instead of letting a NaN slip through
+            // the `max`.
+            *radius = if dist.is_finite() {
+                radius.max(dist)
+            } else {
+                f32::INFINITY
+            };
+        }
     }
 }
 
@@ -318,6 +388,11 @@ impl Engine {
     }
 
     /// Build an engine from a column of vectors and ids.
+    ///
+    /// Every vector is validated first — non-empty, finite, unique id — so a
+    /// bad item fails the whole build instead of producing a partial index.
+    /// Vectors shorter than the longest one are zero-padded, which matches the
+    /// pre-1.0 behaviour.
     pub fn build(data: &[Embedding], ids: &[String], options: IndexOptions) -> EngineResult<Self> {
         if data.len() != ids.len() {
             return Err(EngineError::new(format!(
@@ -327,21 +402,21 @@ impl Engine {
             )));
         }
 
-        let dim = data.iter().map(|vector| vector.len()).max().unwrap_or(0);
-        let mut engine = Engine::new(options);
+        for (vector, id) in data.iter().zip(ids) {
+            validate_vector(id, vector)?;
+        }
 
-        if data.is_empty() || dim == 0 {
-            engine.dim = dim;
-            engine.store = VectorStore::new(dim);
+        let mut engine = Engine::new(options);
+        if data.is_empty() {
             return Ok(engine);
         }
 
+        let dim = data.iter().map(|vector| vector.len()).max().unwrap_or(0);
         engine.dim = dim;
         engine.store = VectorStore::with_capacity(dim, data.len());
         engine.ids = IdMap::with_capacity(data.len());
-        engine.codes = Vec::new();
 
-        for (vector, id) in data.iter().zip(ids.iter()) {
+        for (vector, id) in data.iter().zip(ids) {
             engine.ids.insert(id.clone())?;
             engine.push_prepared(vector);
         }
@@ -351,15 +426,24 @@ impl Engine {
     }
 
     /// Rebuild from a parsed snapshot.
+    ///
+    /// `Snapshot` is a public type with public fields, so this cannot assume it
+    /// came from [`codec::read`]: every size and index is checked here too, and
+    /// an inconsistent snapshot is an error rather than a later panic.
     pub fn from_snapshot(snapshot: Snapshot, options: IndexOptions) -> EngineResult<Self> {
         let dim = snapshot.dim as usize;
         let count = snapshot.count as usize;
 
-        if snapshot.data.len() != count * dim {
+        // Multiplied in `u64`: on wasm32 a `usize` product of two large `u32`
+        // fields can wrap to a small number that matches a short buffer, and
+        // the slicing below would then panic.
+        let expected = (count as u64)
+            .checked_mul(dim as u64)
+            .ok_or_else(|| EngineError::corrupt("count × dim overflow"))?;
+        if snapshot.data.len() as u64 != expected {
             return Err(EngineError::corrupt(format!(
-                "vector buffer holds {} floats, expected {}",
-                snapshot.data.len(),
-                count * dim
+                "vector buffer holds {} floats, expected {expected}",
+                snapshot.data.len()
             )));
         }
         if snapshot.ids.len() != count {
@@ -368,58 +452,140 @@ impl Engine {
                 snapshot.ids.len()
             )));
         }
+        if count > 0 && dim == 0 {
+            return Err(EngineError::corrupt("vectors with zero dimension"));
+        }
+        if snapshot.data.iter().any(|value| !value.is_finite()) {
+            return Err(EngineError::corrupt("vector data contains NaN or infinity"));
+        }
 
-        let mut store = VectorStore::new(dim);
+        let mut store = VectorStore::with_capacity(dim, count);
         for row in 0..count {
             store.push(&snapshot.data[row * dim..row * dim + dim]);
         }
 
         let mut engine = Engine::new(options);
+        // The metric belongs to the data, not to the caller's options: the
+        // vectors were normalised (or not) for it when they were stored.
         engine.distance = snapshot.distance;
+        engine.options.distance = snapshot.distance;
         engine.dim = dim;
         engine.store = store;
         engine.ids = IdMap::from_ids(snapshot.ids);
-        engine.nprobe = snapshot.nprobe as usize;
         engine.rows_at_last_train = count;
 
-        if snapshot.nlist > 0 && !snapshot.centroids.is_empty() {
-            let nlist = snapshot.nlist as usize;
-            let expected = nlist * dim;
+        let nlist = snapshot.nlist as usize;
+        let has_index = nlist > 0 && count > 0 && !snapshot.centroids.is_empty();
 
-            if snapshot.centroids.len() != expected {
+        if has_index {
+            let centroid_floats = (nlist as u64)
+                .checked_mul(dim as u64)
+                .ok_or_else(|| EngineError::corrupt("centroid count overflow"))?;
+            if snapshot.centroids.len() as u64 != centroid_floats {
                 return Err(EngineError::corrupt(format!(
-                    "centroid buffer holds {} floats, expected {expected}",
+                    "centroid buffer holds {} floats, expected {centroid_floats}",
                     snapshot.centroids.len()
                 )));
             }
+            if snapshot.centroids.iter().any(|value| !value.is_finite()) {
+                return Err(EngineError::corrupt("centroids contain NaN or infinity"));
+            }
+            if snapshot.lists.len() != nlist {
+                return Err(EngineError::corrupt(format!(
+                    "{} inverted lists for {nlist} cells",
+                    snapshot.lists.len()
+                )));
+            }
 
+            let lists_valid = lists_cover_rows_once(&snapshot.lists, count);
             engine.ivf = Ivf {
-                centroid_norms: (0..nlist)
-                    .map(|cell| simd::norm_sq(&snapshot.centroids[cell * dim..cell * dim + dim]))
-                    .collect(),
                 centroids: snapshot.centroids,
                 lists: snapshot.lists,
+                radii: Vec::new(),
             };
+
+            if lists_valid {
+                engine.recompute_radii();
+            } else {
+                // A row missing from every list would be unreachable, and a
+                // row in two lists would be returned twice. Our writer never
+                // produces either, but re-filing is cheap insurance next to
+                // returning a wrong answer.
+                engine.assign_all_rows();
+            }
+
+            // The caller's `nprobe` wins over the stored one — it is a
+            // search-time knob, and `load_with_options` promises exactly this.
+            let stored = snapshot.nprobe as usize;
+            engine.nprobe = options.nprobe.unwrap_or(stored).clamp(1, nlist);
+
+            match snapshot.pq {
+                Some(pq) => {
+                    engine.install_pq(pq, snapshot.codes, count)?;
+                }
+                None => engine.train_pq(),
+            }
         } else {
-            // The snapshot carried no index (a legacy import, or a corpus that
-            // was below the threshold when it was written). Rebuild it here so
-            // the caller never sees a half-initialised engine.
+            // No index in the snapshot (a legacy import, or a corpus that was
+            // below the threshold when written). Build one if it is due.
             engine.train();
         }
 
-        if let Some(pq) = snapshot.pq {
-            engine.pq = Pq {
-                m: pq.m as usize,
-                ksub: pq.ksub as usize,
-                subvector_dim: pq.subvector_dim as usize,
-                codebooks: pq.codebooks,
-            };
-            engine.codes = snapshot.codes;
-        } else if !engine.ivf.is_empty() {
-            engine.train_pq();
+        // Duplicate ids in the snapshot became tombstones in `IdMap::from_ids`,
+        // keeping every later id on its own vector. Sweep them now so the
+        // engine is dense, as one built from scratch would be.
+        if engine.ids.dead() > 0 {
+            engine.compact();
         }
 
         Ok(engine)
+    }
+
+    /// Validate and adopt stored PQ codebooks and codes.
+    fn install_pq(&mut self, pq: PqSnapshot, codes: Vec<u8>, count: usize) -> EngineResult<()> {
+        let m = pq.m as usize;
+        let ksub = pq.ksub as usize;
+        let subvector_dim = pq.subvector_dim as usize;
+
+        if m == 0 || subvector_dim == 0 || !(1..=256).contains(&ksub) {
+            return Err(EngineError::corrupt(format!(
+                "PQ shape m={m} ksub={ksub} subvector_dim={subvector_dim} is invalid"
+            )));
+        }
+        if m.checked_mul(subvector_dim) != Some(self.dim) {
+            return Err(EngineError::corrupt(format!(
+                "PQ covers {m} × {subvector_dim} dimensions, the index has {}",
+                self.dim
+            )));
+        }
+        let codebook_len = (m as u64) * (ksub as u64) * (subvector_dim as u64);
+        if pq.codebooks.len() as u64 != codebook_len {
+            return Err(EngineError::corrupt(format!(
+                "PQ codebooks hold {} floats, expected {codebook_len}",
+                pq.codebooks.len()
+            )));
+        }
+        if (codes.len() as u64) != (count as u64) * (m as u64) {
+            return Err(EngineError::corrupt(format!(
+                "PQ code buffer is {} bytes, expected {}",
+                codes.len(),
+                (count as u64) * (m as u64)
+            )));
+        }
+        if let Some(&code) = codes.iter().find(|&&code| code as usize >= ksub) {
+            return Err(EngineError::corrupt(format!(
+                "PQ code {code} is outside the {ksub}-entry codebook"
+            )));
+        }
+
+        self.pq = Pq {
+            m,
+            ksub,
+            subvector_dim,
+            codebooks: pq.codebooks,
+        };
+        self.codes = codes;
+        Ok(())
     }
 
     // -- simple accessors -------------------------------------------------
@@ -460,13 +626,14 @@ impl Engine {
         self.nprobe
     }
 
-    /// Change how many cells a query probes, without rebuilding.
+    /// Change how many cells an approximate query probes, without rebuilding.
     ///
     /// `nprobe` is purely a search-time knob — the cells and their contents do
     /// not depend on it — so retuning recall against latency should not cost a
     /// rebuild. The value also becomes the configured one, so a later retrain
     /// keeps it instead of reverting to the default ratio. Clamped to
-    /// `1..=nlist`; ignored while there is no index.
+    /// `1..=nlist`; ignored while there is no index. Has no effect on the
+    /// default exact search, which decides for itself which cells to visit.
     pub fn set_nprobe(&mut self, nprobe: usize) {
         let nlist = self.ivf.nlist();
         if nlist == 0 {
@@ -475,6 +642,11 @@ impl Engine {
         let nprobe = nprobe.clamp(1, nlist);
         self.nprobe = nprobe;
         self.options.nprobe = Some(nprobe);
+    }
+
+    /// Switch between exact (default) and approximate fixed-`nprobe` search.
+    pub fn set_approximate(&mut self, approximate: bool) {
+        self.options.approximate = approximate;
     }
 
     /// Coarse cell count; `0` when there is no IVF index.
@@ -504,6 +676,7 @@ impl Engine {
         self.store.memory_bytes()
             + self.ids.memory_bytes()
             + self.ivf.centroids.len() * 4
+            + self.ivf.radii.len() * 4
             + self
                 .ivf
                 .lists
@@ -521,48 +694,86 @@ impl Engine {
     /// Takes a slice rather than `&Embedding` so callers can pass an array
     /// literal or a borrowed row without allocating a `Vec` first.
     pub fn add(&mut self, id: String, vector: &[f32]) -> EngineResult<()> {
+        validate_vector(&id, vector)?;
+
         if self.ids.contains(&id) {
             return Err(EngineError::duplicate_id(&id));
         }
 
-        if self.dim == 0 {
+        if self.dim == 0 && self.store.rows() == 0 {
+            // First vector into an empty engine fixes the dimension. Checking
+            // the store as well as `dim` matters: replacing a store that still
+            // holds rows would detach every existing id from its vector.
             self.dim = vector.len();
             self.store = VectorStore::new(self.dim);
         } else if vector.len() != self.dim {
             return Err(EngineError::dimension_mismatch(self.dim, vector.len()));
         }
 
-        let row = self.push_prepared(vector);
+        // Id first, then row: both append, so the row index `insert` returns
+        // is exactly the one `push_prepared` is about to use.
         self.ids.insert(id)?;
-        let _ = row;
+        let row = self.push_prepared(vector);
 
         // Incremental: place the row in its nearest existing cell and encode
         // it against the existing codebooks. No retraining.
         if self.ivf.is_empty() {
             self.maybe_train();
         } else {
-            self.insert_into_ivf(self.store.rows() - 1);
+            self.insert_into_ivf(row);
+            self.maybe_retrain();
         }
 
-        self.maybe_retrain();
         Ok(())
     }
 
-    /// Add many vectors. Errors on the first duplicate and leaves the engine
-    /// with the vectors added so far, matching how a partial ingest behaves in
-    /// the old implementation.
+    /// Add many vectors, atomically.
+    ///
+    /// The whole batch is validated first — ids unique against the index and
+    /// within the batch, one dimension, every value finite — so a bad item
+    /// leaves the engine exactly as it was rather than holding half a batch.
     pub fn add_many(&mut self, items: &[(String, Embedding)]) -> EngineResult<()> {
+        let mut dim = if self.dim == 0 && self.store.rows() == 0 {
+            None
+        } else {
+            Some(self.dim)
+        };
+        let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
+
+        for (id, vector) in items {
+            validate_vector(id, vector)?;
+            if self.ids.contains(id) || !seen.insert(id.as_str()) {
+                return Err(EngineError::duplicate_id(id));
+            }
+            match dim {
+                None => dim = Some(vector.len()),
+                Some(expected) if expected != vector.len() => {
+                    return Err(EngineError::dimension_mismatch(expected, vector.len()));
+                }
+                Some(_) => {}
+            }
+        }
+
         for (id, vector) in items {
             self.add(id.clone(), vector)?;
         }
         Ok(())
     }
 
-    /// Remove ids. Rows are tombstoned; compaction happens when the dead
-    /// fraction crosses `options.compact_ratio`.
+    /// Remove ids, atomically: every id is checked before any is removed, so
+    /// an unknown id leaves the engine untouched. An id repeated within the
+    /// call is removed once. Rows are tombstoned; compaction happens when the
+    /// dead fraction crosses `options.compact_ratio`.
     pub fn remove(&mut self, ids: &[String]) -> EngineResult<()> {
+        if let Some(missing) = ids.iter().find(|id| !self.ids.contains(id)) {
+            return Err(EngineError::missing_id(missing));
+        }
+
+        let mut seen: HashSet<&str> = HashSet::with_capacity(ids.len());
         for id in ids {
-            self.ids.remove(id)?;
+            if seen.insert(id.as_str()) {
+                self.ids.remove(id)?;
+            }
         }
 
         if self.ids.is_empty() {
@@ -596,20 +807,19 @@ impl Engine {
             return;
         }
 
-        let dim = self.dim;
         let slots = self.store.rows();
 
         // Build old-row → new-row mapping.
         let mut mapping: Vec<Option<u32>> = vec![None; slots];
         let mut next = 0u32;
-        for row in 0..slots {
+        for (row, slot) in mapping.iter_mut().enumerate() {
             if self.ids.id_of(row).is_some() {
-                mapping[row] = Some(next);
+                *slot = Some(next);
                 next += 1;
             }
         }
 
-        let ids = self.ids.compact(&mapping);
+        self.ids.compact(&mapping);
 
         // Which *old* rows survive, in new-row order.
         //
@@ -643,182 +853,286 @@ impl Engine {
             self.codes = codes;
         }
 
-        // Rebuild the lists from the surviving assignments. Cheap: one
-        // nearest-centroid lookup per row.
-        if !self.ivf.is_empty() {
-            let nlist = self.ivf.nlist();
-            let mut lists: Vec<Vec<u32>> = vec![Vec::new(); nlist];
-
-            for row in 0..self.store.rows() {
-                let cell = self.ivf.nearest_centroid(self.store.row(row), dim);
-                lists[cell].push(row as u32);
-            }
-
-            self.ivf.lists = lists;
+        // Renumber the lists in place. Every surviving row stays in the cell it
+        // was filed in, so the radii are still valid bounds — dropping rows can
+        // only make a cell's true radius smaller. `O(n)`, where re-filing every
+        // row against every centroid would be `O(n · nlist · d)`.
+        for list in &mut self.ivf.lists {
+            list.retain_mut(|row| match mapping.get(*row as usize).copied().flatten() {
+                Some(new_row) => {
+                    *row = new_row;
+                    true
+                }
+                None => false,
+            });
         }
 
-        let _ = ids;
+        // Retraining is due after a fraction of the corpus has been *added*
+        // since the last training run. Growth is measured as `rows -
+        // rows_at_last_train`, so removing rows must lower the baseline by the
+        // same amount, or the next retrain is pushed back by every deletion.
+        let removed = slots - keep.len();
+        self.rows_at_last_train = self.rows_at_last_train.saturating_sub(removed);
     }
 
     // -- search -----------------------------------------------------------
 
     /// Search for the `k` nearest neighbours of `query`.
+    ///
+    /// Exact unless `options.approximate` is set; `SearchOutcome::exact` says
+    /// which. `k` is clamped to the number of stored vectors, so an absurd `k`
+    /// costs nothing extra. A query containing NaN or infinity has no
+    /// meaningful neighbours and returns none — the wasm binding reports it as
+    /// an error before getting here.
     pub fn search(&self, query: &[f32], k: usize) -> SearchOutcome {
-        if self.is_empty() || self.dim == 0 {
-            // Nothing to approximate: an empty answer over an empty index is
-            // exact, and saying otherwise would make a caller waste a
-            // `search_exact` call verifying a trivially-correct result.
+        let k = k.min(self.len());
+        if k == 0 || self.dim == 0 || !is_finite(query) {
+            // Nothing to approximate: an empty answer is exact, and saying
+            // otherwise would make a caller waste a `search_exact` call
+            // verifying a trivially-correct result.
             return SearchOutcome {
                 exact: true,
                 ..SearchOutcome::default()
             };
         }
 
-        if k == 0 {
-            // A deliberate no-op is not an approximation either.
-            return SearchOutcome {
-                exact: true,
-                ..SearchOutcome::default()
-            };
-        }
-
-        let mut prepared = self.prepare_query(query);
-
-        if self.distance == Distance::Cosine {
-            simd::normalize_in_place(&mut prepared);
-        }
+        let prepared = self.prepare_query(query);
 
         if self.ivf.is_empty() {
-            // The flat scan computes every distance exactly, so the result is
-            // exact by construction — reporting `false` here would mislabel the
-            // one path that has no approximation error at all.
-            return self.search_flat(&prepared, k, true);
+            return self.search_flat(&prepared, k);
         }
-
-        self.search_ivf(&prepared, k)
+        if self.options.approximate {
+            return self.search_approximate(&prepared, k);
+        }
+        self.search_pruned(&prepared, k)
     }
 
-    /// Exact brute-force search, ignoring the IVF index. Exists so callers can
+    /// Brute-force search, ignoring the IVF index. Exists so callers can
     /// measure recall against ground truth — and so the benchmark has a
     /// baseline that does not depend on index quality.
     pub fn search_exact(&self, query: &[f32], k: usize) -> SearchOutcome {
-        if k == 0 || self.is_empty() || self.dim == 0 {
+        let k = k.min(self.len());
+        if k == 0 || self.dim == 0 || !is_finite(query) {
             return SearchOutcome {
                 exact: true,
                 ..SearchOutcome::default()
             };
         }
 
-        let mut prepared = self.prepare_query(query);
+        let prepared = self.prepare_query(query);
+        self.search_flat(&prepared, k)
+    }
+
+    /// Coerce a query to the index dimension and, for Cosine, to unit length.
+    ///
+    /// A too-short query is zero-padded and an over-long one truncated, which
+    /// matches the pre-1.0 `prepare_vector`.
+    fn prepare_query(&self, query: &[f32]) -> Vec<f32> {
+        let mut prepared = self.fit_dimension(query);
         if self.distance == Distance::Cosine {
             simd::normalize_in_place(&mut prepared);
         }
-
-        self.search_flat(&prepared, k, true)
-    }
-
-    /// Coerce a query to the index dimension.
-    ///
-    /// A too-short query is zero-padded and an over-long one truncated, which
-    /// matches the old `prepare_vector`. Padding a *short* query is the right
-    /// call for robustness, but note it changes the result silently — hence
-    /// the explicit `truncated_dimension` flag on the outcome so a caller can
-    /// detect it.
-    fn prepare_query(&self, query: &[f32]) -> Vec<f32> {
-        if query.len() == self.dim {
-            return query.to_vec();
-        }
-
-        let mut prepared = vec![0.0f32; self.dim];
-        let copy = query.len().min(self.dim);
-        prepared[..copy].copy_from_slice(&query[..copy]);
         prepared
     }
 
-    /// Fixed-size top-`k` collector.
+    /// Score every live row.
     ///
-    /// A plain `Vec` plus insert-and-truncate beats `BinaryHeap` here: `k` is
-    /// small (tens), the vector stays in cache, and there is no per-element
-    /// allocation. The heap's `log k` only pays off when `k` is large.
-    fn search_flat(&self, query: &[f32], k: usize, exact: bool) -> SearchOutcome {
-        let rows = self.store.rows();
-        let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+    /// A plain sorted `Vec` beats `BinaryHeap` as the top-`k` collector here:
+    /// `k` is small (tens), the vector stays in cache, and there is no
+    /// per-element allocation.
+    fn search_flat(&self, query: &[f32], k: usize) -> SearchOutcome {
+        let mut top: Vec<(f32, u32)> = Vec::with_capacity(k.saturating_add(1));
+        let mut scored = 0usize;
 
-        for row in 0..rows {
+        for row in 0..self.store.rows() {
             if self.ids.id_of(row).is_none() {
                 continue;
             }
-
+            scored += 1;
             // `score_row` normalises NaN to `+inf`, so no extra check here.
             insert_top(&mut top, self.score_row(row, query), row as u32, k);
         }
 
         SearchOutcome {
             neighbors: self.collect(&top),
-            candidates_scored: rows,
-            exact,
+            candidates_scored: scored,
+            exact: true,
             ..SearchOutcome::default()
         }
     }
 
-    fn search_ivf(&self, query: &[f32], k: usize) -> SearchOutcome {
-        let dim = self.dim;
-        let nlist = self.ivf.nlist();
+    /// Exact search over the IVF cells, pruned by the per-cell radius bound.
+    /// See the module docs for why this is exact.
+    fn search_pruned(&self, query: &[f32], k: usize) -> SearchOutcome {
+        let query_norm = simd::norm_sq(query).sqrt();
 
-        // 1. Coarse: pick the `nprobe` nearest cells. `select_nth_unstable`
-        //    partitions in O(nlist) instead of sorting in O(nlist log nlist).
-        let mut cell_scores: Vec<(f32, u32)> = (0..nlist)
+        // (lower bound, tie-break, cell). Visiting in bound order lets the scan
+        // stop at the first cell that cannot beat the current k-th best: every
+        // later cell has a bound at least as large. Among cells whose bound is
+        // equal — typically several at zero, when the query sits inside their
+        // radius — the closest centroid goes first, so the k-th best tightens
+        // as early as possible.
+        let mut order: Vec<(f32, f32, u32)> = (0..self.ivf.nlist())
             .map(|cell| {
-                let centroid = &self.ivf.centroids[cell * dim..cell * dim + dim];
-                // Cached-norm expansion: the centroids' norms never change, so
-                // this is one dot per cell.
-                let dist = self.ivf.centroid_norms[cell] + simd::norm_sq(query)
-                    - 2.0 * simd::dot(query, centroid);
-                (dist, cell as u32)
+                let (bound, closeness) = self.cell_bound(query, query_norm, cell);
+                (bound, closeness, cell as u32)
             })
             .collect();
+        order.sort_unstable_by(|a, b| cmp_score(a.0, b.0).then(cmp_score(a.1, b.1)));
 
-        // A NaN from the expansion must not scramble the partition.
-        for entry in cell_scores.iter_mut() {
-            if !entry.0.is_finite() {
-                entry.0 = f32::MAX;
+        let mut top: Vec<(f32, u32)> = Vec::with_capacity(k.saturating_add(1));
+        let mut scored = 0usize;
+        let mut probed = 0usize;
+
+        for &(bound, _, cell) in &order {
+            if top.len() >= k && top.last().is_some_and(|&(worst, _)| bound > worst) {
+                break;
+            }
+
+            probed += 1;
+            for &row in &self.ivf.lists[cell as usize] {
+                let row = row as usize;
+                if self.ids.id_of(row).is_none() {
+                    continue;
+                }
+                scored += 1;
+                insert_top(&mut top, self.score_row(row, query), row as u32, k);
             }
         }
 
-        let nprobe = self.effective_nprobe(k).min(nlist);
+        SearchOutcome {
+            neighbors: self.collect(&top),
+            candidates_scored: scored,
+            rescored: 0,
+            cells_probed: probed,
+            exact: true,
+        }
+    }
+
+    /// A lower bound on the score of any row filed in `cell`, plus the
+    /// centroid's own score as a tie-break.
+    ///
+    /// * Euclidean: `|q - x| >= |q - c| - r` (triangle inequality).
+    /// * Cosine: rows and query are unit length (or zero), and for those
+    ///   `1 - q·x >= |q - x|² / 2`, so the Euclidean bound squared and halved.
+    /// * Dot product: `q·x = q·c + q·(x - c) <= q·c + |q|·r` (Cauchy–Schwarz),
+    ///   and the score is `-q·x`.
+    ///
+    /// Each bound is loosened so rounding can only cost speed, never a
+    /// neighbour: by [`BOUND_SLACK`] relative to the magnitudes involved, and
+    /// for Cosine and dot product also by an absolute term for the rounding in
+    /// a `d`-term dot product, whose error scales with `|q|·|x|` rather than
+    /// with the (possibly near-zero) result. A NaN bound becomes `-inf` —
+    /// "cannot prune" — rather than poisoning the ordering.
+    fn cell_bound(&self, query: &[f32], query_norm: f32, cell: usize) -> (f32, f32) {
+        let centroid = self.ivf.centroid(cell, self.dim);
+        let radius = self.ivf.radii.get(cell).copied().unwrap_or(f32::INFINITY);
+        let dot_rounding = 4.0 * self.dim as f32 * f32::EPSILON;
+
+        let (bound, closeness) = match self.distance {
+            Distance::Euclidean | Distance::Cosine => {
+                let to_centroid = simd::l2_sq(query, centroid).sqrt();
+                let slack = BOUND_SLACK * (to_centroid + radius);
+                // `f32::max` drops a NaN operand, so an undefined gap is 0,
+                // which never prunes.
+                let gap = (to_centroid - radius - slack).max(0.0);
+                let bound = if self.distance == Distance::Euclidean {
+                    gap
+                } else {
+                    // Unit vectors are only unit to within rounding, and the
+                    // score is `1 - dot`, which can land a few ulps below the
+                    // exact identity's value. Subtracting the dot product's
+                    // rounding allowance keeps a near-duplicate's cell from
+                    // being pruned by a hair.
+                    0.5 * gap * gap - dot_rounding
+                };
+                (bound, to_centroid)
+            }
+            Distance::DotProduct => {
+                let along = simd::dot(query, centroid);
+                let centroid_norm = simd::norm_sq(centroid).sqrt();
+                let spread = query_norm * radius;
+                // `|x| <= |c| + r` for every row in the cell, so this covers
+                // the rounding of both `q·c` and the row's own `q·x`.
+                let scale = query_norm * (centroid_norm + radius);
+                let slack = (BOUND_SLACK + dot_rounding) * scale;
+                (-(along + spread + slack), -along)
+            }
+        };
+
+        let bound = if bound.is_nan() {
+            f32::NEG_INFINITY
+        } else {
+            bound
+        };
+        let closeness = if closeness.is_nan() {
+            f32::INFINITY
+        } else {
+            closeness
+        };
+        (bound, closeness)
+    }
+
+    /// Approximate search: probe a fixed `nprobe` cells, optionally prefilter
+    /// with PQ, rescore exactly.
+    fn search_approximate(&self, query: &[f32], k: usize) -> SearchOutcome {
+        let dim = self.dim;
+        let nlist = self.ivf.nlist();
+        let query_norm = simd::norm_sq(query).sqrt();
+
+        // 1. Coarse: pick the `nprobe` most promising cells.
+        //
+        // Euclidean and Cosine rank by exact `l2_sq` to the centroid — the same
+        // function rows were filed with. Ranking by the cached-norm expansion
+        // `|q|² + |c|² - 2q·c` instead disagreed with the assignment after
+        // rounding, so a query could miss the very cell its twin was filed in.
+        // Dot product ranks by the upper bound `q·c + |q|·r`: ranking by
+        // centroid L2 skipped large-norm rows, which are exactly the ones an
+        // inner-product search is looking for.
+        let mut cell_scores: Vec<(f32, u32)> = (0..nlist)
+            .map(|cell| {
+                let score = match self.distance {
+                    Distance::Euclidean | Distance::Cosine => {
+                        simd::l2_sq(query, self.ivf.centroid(cell, dim))
+                    }
+                    Distance::DotProduct => self.cell_bound(query, query_norm, cell).0,
+                };
+                let score = if score.is_nan() { f32::INFINITY } else { score };
+                (score, cell as u32)
+            })
+            .collect();
+
+        let nprobe = self.effective_nprobe(k).clamp(1, nlist.max(1));
         if nprobe < cell_scores.len() {
             cell_scores.select_nth_unstable_by(nprobe - 1, |a, b| cmp_score(a.0, b.0));
             cell_scores.truncate(nprobe);
         }
         cell_scores.sort_unstable_by(|a, b| cmp_score(a.0, b.0));
 
-        let cells: Vec<usize> = cell_scores.iter().map(|(_, cell)| *cell as usize).collect();
+        // 2. PQ prefilter, where it applies. Its tables approximate squared
+        //    L2, so it is never used for dot product.
+        let use_pq = !self.pq.is_empty()
+            && !self.options.exact_rescore_only
+            && self.distance != Distance::DotProduct;
+        let budget = k.saturating_mul(RESCORE_FACTOR).max(MIN_RESCORE_CANDIDATES);
 
-        // 2. Candidate budget.
-        let budget = (k * RESCORE_FACTOR).max(MIN_RESCORE_CANDIDATES);
+        let mut candidates: Vec<(f32, u32)> = Vec::new();
 
-        // 3. Approximate pass. PQ tables depend only on the query and the cell
-        //    residual, so they are built per cell but reused across that cell's
-        //    members — the old code rebuilt them per member.
-        let mut candidates: Vec<(f32, u32)> = Vec::with_capacity(budget);
-
-        for &cell in &cells {
+        for &(_, cell) in &cell_scores {
+            let cell = cell as usize;
             let list = &self.ivf.lists[cell];
 
-            if self.pq.is_empty() || self.options.exact_rescore_only {
-                // No codes: score exactly. Still far cheaper than a full scan,
-                // because only the probed cells are touched.
+            if !use_pq {
                 for &row in list {
                     let row = row as usize;
-                    if self.ids.id_of(row).is_none() {
-                        continue;
+                    if self.ids.id_of(row).is_some() {
+                        candidates.push((self.score_row(row, query), row as u32));
                     }
-                    candidates.push((self.score_row(row, query), row as u32));
                 }
                 continue;
             }
 
-            let centroid = &self.ivf.centroids[cell * dim..cell * dim + dim];
+            let centroid = self.ivf.centroid(cell, dim);
             let residual: Vec<f32> = query
                 .iter()
                 .zip(centroid.iter())
@@ -833,63 +1147,48 @@ impl Engine {
                 }
 
                 let start = row * self.pq.m;
-                let code = match self.codes.get(start..start + self.pq.m) {
-                    Some(code) => code,
-                    // A row without a code (added after the last training run
-                    // and not yet encoded) falls back to an exact score.
-                    None => {
-                        candidates.push((self.score_row(row, query), row as u32));
-                        continue;
+                match self.codes.get(start..start + self.pq.m) {
+                    Some(code) => {
+                        let approx = self.pq.score_code(code, &tables);
+                        let approx = if approx.is_nan() {
+                            f32::INFINITY
+                        } else {
+                            approx
+                        };
+                        candidates.push((approx, row as u32));
                     }
-                };
-
-                let approx = self.pq.score_code(code, &tables);
-                if approx.is_finite() {
-                    candidates.push((approx, row as u32));
+                    // A row without a code falls back to an exact score.
+                    None => candidates.push((self.score_row(row, query), row as u32)),
                 }
             }
         }
 
-        if candidates.is_empty() {
-            // Every probed cell was empty or tombstoned — fall back rather than
-            // returning nothing for a query that clearly has neighbours.
-            let mut outcome = self.search_flat(query, k, true);
-            outcome.candidates_scored = self.store.rows();
-            return outcome;
-        }
-
         let scored = candidates.len();
 
-        // 4. Trim to the budget, then rescore exactly.
-        if candidates.len() > budget {
+        // 3. Trim to the budget (PQ scores only — exact scores need no trim),
+        //    then rescore exactly into the top-k.
+        if use_pq && candidates.len() > budget {
             candidates.select_nth_unstable_by(budget - 1, |a, b| cmp_score(a.0, b.0));
             candidates.truncate(budget);
         }
 
-        let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+        let mut top: Vec<(f32, u32)> = Vec::with_capacity(k.saturating_add(1));
         let mut rescored = 0usize;
-        let exact = self.pq.is_empty() || self.options.exact_rescore_only;
-
-        for (_, row) in candidates {
-            let row = row as usize;
-            if self.ids.id_of(row).is_none() {
-                continue;
-            }
-
-            // `score_row` clamps NaN, so this is always insertable.
-            if !exact {
+        for &(score, row) in &candidates {
+            let score = if use_pq {
                 rescored += 1;
-            }
-            insert_top(&mut top, self.score_row(row, query), row as u32, k);
+                self.score_row(row as usize, query)
+            } else {
+                score
+            };
+            insert_top(&mut top, score, row, k);
         }
 
-        // 5. Recall guard: if rescoring rejected most candidates, the PQ codes
-        //    are misleading for this query and we widen to a full exact scan
-        //    rather than returning a low-quality answer silently.
-        let exact_fallback = top.len() < k;
-        if exact_fallback {
-            let mut outcome = self.search_flat(query, k, true);
-            outcome.candidates_scored = scored;
+        // 4. Recall guard: the probed cells did not hold `k` live rows, so the
+        //    answer would come back short. Fall back to the exact search.
+        if top.len() < k {
+            let mut outcome = self.search_pruned(query, k);
+            outcome.candidates_scored += scored;
             return outcome;
         }
 
@@ -897,7 +1196,7 @@ impl Engine {
             neighbors: self.collect(&top),
             candidates_scored: scored,
             rescored,
-            cells_probed: cells.len(),
+            cells_probed: cell_scores.len(),
             exact: false,
         }
     }
@@ -910,16 +1209,11 @@ impl Engine {
     /// # NaN handling
     ///
     /// Every arm funnels non-finite results to `+inf` rather than dropping the
-    /// row. This matters: a query of `f32::MAX` against a stored `f32::MAX`
-    /// produces `inf - inf = NaN` in the subtraction, and *every* row becomes
-    /// NaN. Filtering those out — which is what the callers used to do — makes
-    /// a valid query return zero neighbours instead of the corpus, and a
-    /// bounded top-k then comes back short. Mapping to `+inf` keeps the row in
-    /// the running and sorts it last, which is the semantically right answer:
-    /// an unrepresentably large distance really is the worst case.
-    ///
-    /// `f32::INFINITY.to_string()` in a result is therefore a legitimate value,
-    /// not a symptom. It only appears when the input itself overflows f32.
+    /// row. Inputs are validated finite, but finite inputs can still overflow:
+    /// a query of `f32::MAX` against a stored `f32::MAX` produces
+    /// `inf - inf = NaN` in a dot product. Mapping to `+inf` keeps the row in
+    /// the running and sorts it last, which is the right answer: an
+    /// unrepresentably large distance really is the worst case.
     #[inline]
     fn score_row(&self, row: usize, query: &[f32]) -> f32 {
         let vector = self.store.row(row);
@@ -956,26 +1250,27 @@ impl Engine {
             self.default_nprobe()
         };
         // Probing more cells than the answer needs is wasted work; probing too
-        // few loses recall. Scale with k, clamped to the configured value.
+        // few loses recall. Scale with k, clamped to the cell count.
         base.max((k / 4).max(1)).min(self.ivf.nlist().max(1))
     }
 
     fn default_nprobe(&self) -> usize {
         let nlist = self.ivf.nlist().max(1);
-        ((nlist as f32 * DEFAULT_NPROBE_RATIO).round() as usize).clamp(1, nlist)
+        ((nlist as f32 * DEFAULT_NPROBE_RATIO).round() as usize)
+            .max(MIN_DEFAULT_NPROBE)
+            .clamp(1, nlist)
     }
 
     // -- index construction ----------------------------------------------
 
-    /// Normalise, store, and return the new row index. Does **not** touch the
-    /// ids map — callers do that so a failed insert leaves no partial state.
+    /// Fit to the index dimension, normalise for Cosine, store, and return
+    /// the new row index. Does **not** touch the ids map — callers do that so
+    /// a failed insert leaves no partial state.
     fn push_prepared(&mut self, vector: &[f32]) -> usize {
-        let prepared = if self.distance == Distance::Cosine {
-            simd::normalize(vector)
-        } else {
-            self.fit_dimension(vector)
-        };
-
+        let mut prepared = self.fit_dimension(vector);
+        if self.distance == Distance::Cosine {
+            simd::normalize_in_place(&mut prepared);
+        }
         self.store.push(&prepared)
     }
 
@@ -991,22 +1286,17 @@ impl Engine {
     }
 
     fn maybe_train(&mut self) {
-        if self.store.rows() >= self.options.ivf_threshold {
+        if self.ids.len() >= self.options.ivf_threshold {
             self.train();
         }
     }
 
     fn maybe_retrain(&mut self) {
-        if self.ivf.is_empty() {
-            self.maybe_train();
-            return;
-        }
-
         let rows = self.store.rows();
         let growth = rows.saturating_sub(self.rows_at_last_train);
         let threshold = ((rows as f32) * self.options.retrain_growth_ratio) as usize;
 
-        if growth >= threshold.max(self.options.nlist.unwrap_or(256)) {
+        if growth >= threshold.max(MIN_RETRAIN_GROWTH) {
             self.train();
         }
     }
@@ -1024,106 +1314,183 @@ impl Engine {
         }
     }
 
-    /// Train the coarse quantiser and rebuild all lists. O(N · nlist · d · iters),
-    /// so this runs only on build and on drift-triggered retrains — never on a
-    /// single insert.
+    /// Train the coarse quantiser and rebuild all lists.
+    ///
+    /// Trains on a sample of `SAMPLES_PER_CENTROID` points per cell rather
+    /// than on every row, so the cost is `O(nlist² · d)` per iteration rather
+    /// than `O(N · nlist · d)`; filing every row afterwards is one more
+    /// `O(N · nlist · d)` pass. Runs only on build and on drift-triggered
+    /// retrains — never on a single insert.
     fn train(&mut self) {
         let rows = self.store.rows();
+        let live = self.ids.len();
         let dim = self.dim;
 
-        if rows == 0 || dim == 0 || rows < self.options.ivf_threshold {
+        let drop_index = |engine: &mut Engine| {
+            engine.ivf = Ivf::default();
+            engine.pq = Pq::default();
+            engine.codes.clear();
+            engine.nprobe = 0;
+            engine.rows_at_last_train = rows;
+        };
+
+        if live == 0 || dim == 0 || live < self.options.ivf_threshold {
             // Below the threshold a flat SIMD scan is the better index, so
             // drop any existing structure and let `search` take the flat path.
-            self.ivf = Ivf::default();
-            self.pq = Pq::default();
-            self.codes.clear();
-            self.nprobe = 0;
-            self.rows_at_last_train = rows;
+            drop_index(self);
             return;
         }
 
-        let sample = self.training_sample(MAX_TRAINING_SAMPLES);
+        let wanted = self
+            .options
+            .nlist
+            .unwrap_or_else(|| default_nlist(live))
+            .clamp(1, live);
+        let sample_cap = wanted
+            .saturating_mul(SAMPLES_PER_CENTROID)
+            .clamp(wanted, MAX_TRAINING_SAMPLES.max(wanted));
+        let sample = self.training_sample(sample_cap);
         let sample_rows = sample.len() / dim;
 
         if sample_rows == 0 {
-            self.ivf = Ivf::default();
-            self.rows_at_last_train = rows;
+            drop_index(self);
             return;
         }
 
-        let nlist = self
-            .options
-            .nlist
-            .unwrap_or_else(|| default_nlist(rows))
-            .min(sample_rows.max(1));
-
         let config = KMeansConfig {
-            k: nlist,
-            max_iter: 12,
+            k: wanted.min(sample_rows),
+            max_iter: KMEANS_ITERATIONS,
             tolerance: 0.001,
             seed: self.options.seed,
         };
 
         let result = match kmeans::train(&sample, sample_rows, dim, config) {
-            Ok(result) => result,
-            Err(_) => {
+            Ok(result) if !result.centroids.is_empty() => result,
+            _ => {
                 // A degenerate corpus (e.g. every vector identical) should
                 // degrade to a flat scan, not fail the build.
-                self.ivf = Ivf::default();
-                self.rows_at_last_train = rows;
+                drop_index(self);
                 return;
             }
         };
 
-        // Flatten centroids into the row-major layout the scan wants.
+        let nlist = result.centroids.len();
         let mut centroids = Vec::with_capacity(nlist * dim);
         for centroid in &result.centroids {
             centroids.extend_from_slice(centroid);
         }
 
         self.ivf = Ivf {
-            centroid_norms: result
-                .centroids
-                .iter()
-                .map(|centroid| simd::norm_sq(centroid))
-                .collect(),
             centroids,
-            lists: vec![Vec::new(); result.centroids.len()],
+            lists: vec![Vec::new(); nlist],
+            radii: vec![0.0; nlist],
         };
 
         self.assign_all_rows();
-        self.nprobe = self.options.nprobe.unwrap_or_else(|| self.default_nprobe());
-        self.rows_at_last_train = rows;
+        self.reorder_by_cell();
+        self.nprobe = self
+            .options
+            .nprobe
+            .unwrap_or_else(|| self.default_nprobe())
+            .clamp(1, nlist);
+        self.rows_at_last_train = self.store.rows();
 
         self.train_pq();
     }
 
-    /// Place every live row into its nearest cell.
+    /// Lay the arena out cell by cell, so every inverted list is a contiguous
+    /// run of rows.
+    ///
+    /// Without this a cell's rows are scattered through the arena in insertion
+    /// order, and scanning one costs a cache miss per row — on unstructured
+    /// data, where the exact search cannot prune much, that made the indexed
+    /// scan slower than the flat one it is meant to beat. Tombstoned rows are
+    /// dropped on the way, since they are in no list. Rows added after this
+    /// are appended at the end until the next training run.
+    fn reorder_by_cell(&mut self) {
+        let slots = self.store.rows();
+        let mut mapping: Vec<Option<u32>> = vec![None; slots];
+        let mut keep: Vec<u32> = Vec::with_capacity(self.ids.len());
+
+        for list in &mut self.ivf.lists {
+            for row in list.iter_mut() {
+                let new_row = keep.len() as u32;
+                if let Some(slot) = mapping.get_mut(*row as usize) {
+                    *slot = Some(new_row);
+                    keep.push(*row);
+                    *row = new_row;
+                }
+            }
+        }
+
+        self.ids.compact(&mapping);
+        self.store.retain_rows(&keep);
+        // Codes are keyed by row; `train_pq` re-encodes after this.
+        self.codes.clear();
+    }
+
+    /// File every live row in its nearest cell, and recompute the radii.
     fn assign_all_rows(&mut self) {
         let dim = self.dim;
-        let nlist = self.ivf.nlist();
-        let mut lists: Vec<Vec<u32>> = (0..nlist).map(|_| Vec::new()).collect();
+        let nlist = self.ivf.centroids.len() / dim.max(1);
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); nlist];
+        let mut radii = vec![0.0f32; nlist];
 
-        for row in 0..self.store.rows() {
-            if self.ids.id_of(row).is_none() {
-                continue;
+        if nlist > 0 {
+            // `nearest_centroid` iterates `lists.len()` cells.
+            self.ivf.lists = vec![Vec::new(); nlist];
+
+            for row in 0..self.store.rows() {
+                if self.ids.id_of(row).is_none() {
+                    continue;
+                }
+                let (cell, dist_sq) = self.ivf.nearest_centroid(self.store.row(row), dim);
+                lists[cell].push(row as u32);
+                let dist = dist_sq.sqrt();
+                radii[cell] = if dist.is_finite() {
+                    radii[cell].max(dist)
+                } else {
+                    f32::INFINITY
+                };
             }
-            let cell = self.ivf.nearest_centroid(self.store.row(row), dim);
-            lists[cell].push(row as u32);
         }
 
         self.ivf.lists = lists;
+        self.ivf.radii = radii;
+    }
+
+    /// Recompute every cell's radius from its current members. `O(N · d)`.
+    fn recompute_radii(&mut self) {
+        let dim = self.dim;
+        let mut radii = vec![0.0f32; self.ivf.nlist()];
+
+        for (cell, list) in self.ivf.lists.iter().enumerate() {
+            let centroid = self.ivf.centroid(cell, dim);
+            let mut radius = 0.0f32;
+            for &row in list {
+                let dist = simd::l2_sq(self.store.row(row as usize), centroid).sqrt();
+                radius = if dist.is_finite() {
+                    radius.max(dist)
+                } else {
+                    f32::INFINITY
+                };
+            }
+            radii[cell] = radius;
+        }
+
+        self.ivf.radii = radii;
     }
 
     /// Incremental placement: nearest cell + one code. This is the whole point
     /// of the rewrite — the old code retrained here.
     fn insert_into_ivf(&mut self, row: usize) {
         let dim = self.dim;
-        let cell = self.ivf.nearest_centroid(self.store.row(row), dim);
+        let (cell, dist_sq) = self.ivf.nearest_centroid(self.store.row(row), dim);
 
         if let Some(list) = self.ivf.lists.get_mut(cell) {
             list.push(row as u32);
         }
+        self.ivf.widen(cell, dist_sq);
 
         self.encode_row(row, cell);
     }
@@ -1135,10 +1502,10 @@ impl Engine {
         }
 
         let dim = self.dim;
-        let centroid = match self.ivf.centroids.get(cell * dim..cell * dim + dim) {
-            Some(centroid) => centroid,
-            None => return,
-        };
+        let centroid = self.ivf.centroid(cell, dim);
+        if centroid.is_empty() {
+            return;
+        }
 
         let vector = self.store.row(row);
         let residual: Vec<f32> = vector
@@ -1160,7 +1527,13 @@ impl Engine {
         let rows = self.store.rows();
         let dim = self.dim;
 
-        if rows < PQ_MIN_VECTORS || dim == 0 || self.options.exact_rescore_only {
+        // PQ is only ever a prefilter for approximate L2-family searches; for
+        // dot product it would never be consulted, so do not pay to train it.
+        if rows < PQ_MIN_VECTORS
+            || dim == 0
+            || self.options.exact_rescore_only
+            || self.distance == Distance::DotProduct
+        {
             self.pq = Pq::default();
             self.codes.clear();
             return;
@@ -1177,12 +1550,11 @@ impl Engine {
         let ksub = self.options.pq_ksub.unwrap_or(64).clamp(2, 256).min(rows);
 
         // Train on residuals, per subquantiser.
-        let sample = self.residual_sample(MAX_TRAINING_SAMPLES);
-        let sample_rows = if subvector_dim == 0 {
-            0
-        } else {
-            sample.len() / dim
-        };
+        let cap = ksub
+            .saturating_mul(PQ_SAMPLES_PER_CODEWORD)
+            .min(MAX_TRAINING_SAMPLES);
+        let sample = self.residual_sample(cap);
+        let sample_rows = sample.len() / dim;
 
         if sample_rows < ksub {
             self.pq = Pq::default();
@@ -1205,18 +1577,18 @@ impl Engine {
 
             let config = KMeansConfig {
                 k: ksub,
-                max_iter: 12,
+                max_iter: KMEANS_ITERATIONS,
                 tolerance: 0.001,
                 seed: self.options.seed ^ (sub as u64).wrapping_mul(0x9E37_79B9),
             };
 
             match kmeans::train(&subvectors, sample_rows, subvector_dim, config) {
-                Ok(result) => {
+                Ok(result) if result.centroids.len() == ksub => {
                     for centroid in &result.centroids {
                         codebooks.extend_from_slice(centroid);
                     }
                 }
-                Err(_) => {
+                _ => {
                     self.pq = Pq::default();
                     self.codes.clear();
                     return;
@@ -1243,28 +1615,29 @@ impl Engine {
             return;
         }
 
+        let dim = self.dim;
         let mut codes = vec![0u8; rows * m];
 
-        for row in 0..rows {
-            if self.ids.id_of(row).is_none() {
-                continue;
+        // Encode against the cell each row is actually filed in, not its
+        // current nearest centroid: search computes the residual against the
+        // cell being probed, so the two must agree.
+        for (cell, list) in self.ivf.lists.iter().enumerate() {
+            let centroid = self.ivf.centroid(cell, dim);
+            for &row in list {
+                let row = row as usize;
+                if self.ids.id_of(row).is_none() || row >= rows {
+                    continue;
+                }
+                let residual: Vec<f32> = self
+                    .store
+                    .row(row)
+                    .iter()
+                    .zip(centroid.iter())
+                    .map(|(v, c)| v - c)
+                    .collect();
+                let code = self.pq.encode(&residual);
+                codes[row * m..row * m + m].copy_from_slice(&code);
             }
-
-            let cell = self.ivf.nearest_centroid(self.store.row(row), self.dim);
-            let dim = self.dim;
-            let centroid = match self.ivf.centroids.get(cell * dim..cell * dim + dim) {
-                Some(centroid) => centroid,
-                None => continue,
-            };
-
-            let vector = self.store.row(row);
-            let residual: Vec<f32> = vector
-                .iter()
-                .zip(centroid.iter())
-                .map(|(v, c)| v - c)
-                .collect();
-            let code = self.pq.encode(&residual);
-            codes[row * m..row * m + m].copy_from_slice(&code);
         }
 
         self.codes = codes;
@@ -1276,17 +1649,13 @@ impl Engine {
         let rows = self.store.rows();
         let live = self.ids.len();
 
-        if live == 0 || dim == 0 {
+        if live == 0 || dim == 0 || max_samples == 0 {
             return Vec::new();
         }
 
         // Stride sampling keeps the sample spread over insertion order, which
         // for embedding corpora correlates with content.
-        let step = if live > max_samples {
-            live.div_ceil(max_samples)
-        } else {
-            1
-        };
+        let step = live.div_ceil(max_samples).max(1);
 
         let mut out = Vec::with_capacity(live.min(max_samples) * dim);
         let mut taken = 0usize;
@@ -1295,14 +1664,13 @@ impl Engine {
             if self.ids.id_of(row).is_none() {
                 continue;
             }
-            if !taken.is_multiple_of(step) {
-                taken += 1;
+            let pick = taken.is_multiple_of(step);
+            taken += 1;
+            if !pick {
                 continue;
             }
 
             out.extend_from_slice(self.store.row(row));
-            taken += 1;
-
             if out.len() / dim >= max_samples {
                 break;
             }
@@ -1311,44 +1679,38 @@ impl Engine {
         out
     }
 
-    /// Residuals instead of raw vectors, for PQ training.
+    /// Residuals against each row's cell, for PQ training.
     fn residual_sample(&self, max_samples: usize) -> Vec<f32> {
         let dim = self.dim;
-        let rows = self.store.rows();
         let live = self.ids.len();
 
-        if live == 0 || dim == 0 || self.ivf.is_empty() {
+        if live == 0 || dim == 0 || self.ivf.is_empty() || max_samples == 0 {
             return Vec::new();
         }
 
-        let step = if live > max_samples {
-            live.div_ceil(max_samples)
-        } else {
-            1
-        };
-
+        let step = live.div_ceil(max_samples).max(1);
         let mut out = Vec::with_capacity(live.min(max_samples) * dim);
         let mut taken = 0usize;
 
-        for row in 0..rows {
-            if self.ids.id_of(row).is_none() {
-                continue;
-            }
-            if !taken.is_multiple_of(step) {
+        'cells: for (cell, list) in self.ivf.lists.iter().enumerate() {
+            let centroid = self.ivf.centroid(cell, dim);
+            for &row in list {
+                let row = row as usize;
+                if self.ids.id_of(row).is_none() {
+                    continue;
+                }
+                let pick = taken.is_multiple_of(step);
                 taken += 1;
-                continue;
-            }
+                if !pick {
+                    continue;
+                }
 
-            let cell = self.ivf.nearest_centroid(self.store.row(row), dim);
-            let centroid = &self.ivf.centroids[cell * dim..cell * dim + dim];
-            let vector = self.store.row(row);
-            for (v, c) in vector.iter().zip(centroid.iter()) {
-                out.push(v - c);
-            }
-
-            taken += 1;
-            if out.len() / dim >= max_samples {
-                break;
+                for (v, c) in self.store.row(row).iter().zip(centroid.iter()) {
+                    out.push(v - c);
+                }
+                if out.len() / dim >= max_samples {
+                    break 'cells;
+                }
             }
         }
 
@@ -1357,9 +1719,8 @@ impl Engine {
 
     // -- snapshot ---------------------------------------------------------
 
-    /// Build a snapshot. Compacts first when tombstones exist, so a snapshot
-    /// never carries dead rows and always restores into an engine whose row
-    /// indices are dense.
+    /// Build a snapshot. Only live rows are written, renumbered densely, so a
+    /// snapshot never carries tombstones.
     pub fn to_snapshot(&self) -> Snapshot {
         let dim = self.dim;
         let count = self.ids.len();
@@ -1439,6 +1800,40 @@ impl Engine {
     }
 }
 
+/// Reject vectors no search could make sense of. An empty vector used to fix
+/// the index dimension at 0 and detach every later id from its row; a NaN
+/// used to score as a perfect match against everything.
+fn validate_vector(id: &str, vector: &[f32]) -> EngineResult<()> {
+    if vector.is_empty() {
+        return Err(EngineError::new(format!("vector for id {id:?} is empty")));
+    }
+    if let Some(position) = vector.iter().position(|value| !value.is_finite()) {
+        return Err(EngineError::new(format!(
+            "vector for id {id:?} has a non-finite value (NaN or infinity) at index {position}"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn is_finite(values: &[f32]) -> bool {
+    values.iter().all(|value| value.is_finite())
+}
+
+/// `true` when every row in `0..count` appears in exactly one list.
+fn lists_cover_rows_once(lists: &[Vec<u32>], count: usize) -> bool {
+    let mut seen = vec![false; count];
+    for list in lists {
+        for &row in list {
+            match seen.get_mut(row as usize) {
+                Some(slot) if !*slot => *slot = true,
+                _ => return false,
+            }
+        }
+    }
+    seen.iter().all(|&covered| covered)
+}
+
 // ---------------------------------------------------------------------------
 // Outcome
 // ---------------------------------------------------------------------------
@@ -1504,20 +1899,17 @@ fn insert_top(top: &mut Vec<(f32, u32)>, score: f32, row: u32, k: usize) {
     }
 }
 
-/// Default cell count: one cell per ~128 vectors, clamped to a sane band.
+/// Default cell count: `round(sqrt(n))`.
 ///
-/// `nlist ≈ sqrt(n)` (the usual rule) is only right for very large corpora; for
-/// n = 10 000 it gives 100 cells of 100 vectors, which is roughly what we want,
-/// and for n = 1 000 000 it gives 1 000. The clamp keeps small corpora from
-/// producing one cell and large ones from producing a scan-length cell list.
+/// The exact search pays `nlist · d` per query to bound every cell, then scans
+/// the cells it cannot prune; `sqrt(n)` cells of `sqrt(n)` rows balances the
+/// two, and keeps the k-means build at `O(n · d)` per iteration.
 fn default_nlist(rows: usize) -> usize {
     if rows == 0 {
         return 0;
     }
 
-    let target = rows / TARGET_LIST_SIZE;
-    let sqrt = (rows as f64).sqrt() as usize;
-    target.clamp(sqrt / 2, sqrt * 2).max(1).min(rows)
+    ((rows as f64).sqrt().round() as usize).clamp(1, rows)
 }
 
 /// Roughly one PQ byte per 8 dimensions, adjusted so `dim % m == 0` and
@@ -1538,7 +1930,8 @@ fn default_pq_m(dim: usize) -> usize {
 // Free-function API
 // ---------------------------------------------------------------------------
 
-/// Build an index. Errors only on a data/ids length mismatch or a duplicate id.
+/// Build an index. Errors on a data/ids length mismatch, a duplicate id, or an
+/// empty or non-finite vector.
 pub fn index(data: &[Embedding], ids: &[String]) -> EngineResult<Engine> {
     Engine::build(data, ids, IndexOptions::default())
 }
@@ -1783,9 +2176,9 @@ mod tests {
         assert!(engine.is_empty());
         assert_eq!(engine.search(&[1.0, 2.0], 3).neighbors.len(), 0);
 
-        // Zero-dimensional vectors.
-        let engine = Engine::build(&[vec![]], &["empty".to_string()], options()).expect("build");
-        assert_eq!(engine.search(&[], 3).neighbors.len(), 0);
+        // Zero-dimensional vectors are rejected, not stored: an empty vector
+        // used to fix the dimension at 0 and detach later ids from their rows.
+        assert!(Engine::build(&[vec![]], &["empty".to_string()], options()).is_err());
 
         // Mismatched lengths.
         assert!(Engine::build(&corpus(3, 4), &ids_of(2), options()).is_err());
@@ -1993,7 +2386,10 @@ mod tests {
             &ids,
             IndexOptions {
                 ivf_threshold: 256,
+                nlist: Some(46),
                 nprobe: Some(24),
+                exact_rescore_only: false,
+                approximate: true,
                 ..Default::default()
             },
         )
@@ -2096,6 +2492,358 @@ mod tests {
         assert_eq!(cmp_score(1.0, 2.0), Ordering::Less);
         assert_eq!(cmp_score(f32::NAN, 1.0), Ordering::Greater);
         assert_eq!(cmp_score(1.0, f32::NAN), Ordering::Less);
+    }
+
+    /// Clustered fixture: `centres` blobs with noise of `spread` around each.
+    fn clustered(
+        count: usize,
+        dim: usize,
+        centres: usize,
+        spread: f32,
+        seed: u64,
+    ) -> Vec<Embedding> {
+        let middles: Vec<Embedding> = (0..centres)
+            .map(|c| pseudo(seed ^ ((c as u64) << 20), dim))
+            .collect();
+        (0..count)
+            .map(|i| {
+                let noise = pseudo(seed.wrapping_add(0x51_0000 + i as u64), dim);
+                middles[i % centres]
+                    .iter()
+                    .zip(noise)
+                    .map(|(m, n)| m + spread * n)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The default search must return exactly what the brute-force scan
+    /// returns — same ids, same order up to ties — for every metric, on data
+    /// with and without cluster structure.
+    fn assert_matches_exact(engine: &Engine, queries: &[Embedding], k: usize, label: &str) {
+        for (q, query) in queries.iter().enumerate() {
+            let fast = engine.search(query, k);
+            let slow = engine.search_exact(query, k);
+            assert!(fast.exact, "{label}: default search must report exact");
+            assert_eq!(fast.neighbors.len(), slow.neighbors.len(), "{label} q{q}");
+            for (a, b) in fast.neighbors.iter().zip(&slow.neighbors) {
+                // Equal scores may come back in either order; equal *ids* at
+                // unequal scores would be a real miss.
+                assert!(
+                    (a.distance - b.distance).abs() <= 1e-5 * (1.0 + b.distance.abs()),
+                    "{label} q{q}: pruned search returned {} at {}, exact had {} at {}",
+                    a.id,
+                    a.distance,
+                    b.id,
+                    b.distance
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_search_is_exact_for_every_metric() {
+        for distance in [Distance::Euclidean, Distance::Cosine, Distance::DotProduct] {
+            for (label, data) in [
+                ("clustered", clustered(3000, 24, 20, 0.15, 0xC1)),
+                ("uniform", corpus(3000, 24)),
+            ] {
+                let ids = ids_of(data.len());
+                let engine = Engine::build(
+                    &data,
+                    &ids,
+                    IndexOptions {
+                        distance,
+                        ivf_threshold: 256,
+                        ..Default::default()
+                    },
+                )
+                .expect("build");
+                assert!(engine.is_indexed());
+
+                let mut queries: Vec<Embedding> = (0..20).map(|i| pseudo(0xAB00 + i, 24)).collect();
+                queries.extend(data.iter().step_by(311).cloned());
+                assert_matches_exact(&engine, &queries, 10, &format!("{distance:?}/{label}"));
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_search_stays_exact_through_mutation_and_reload() {
+        let data = clustered(2500, 16, 12, 0.2, 0x77);
+        let mut engine = Engine::build(&data, &ids_of(2500), options()).expect("build");
+
+        // Rows added after training land outside the contiguous cell runs and
+        // widen their cell's radius; deletions leave stale radii behind. Both
+        // must keep the bound valid.
+        for i in 0..400 {
+            engine
+                .add(format!("late-{i}"), &pseudo(0xD00D + i, 16))
+                .expect("add");
+        }
+        engine
+            .remove(&(0..500).map(|i| format!("id-{i}")).collect::<Vec<_>>())
+            .expect("remove");
+
+        let queries: Vec<Embedding> = (0..25).map(|i| pseudo(0xE00 + i, 16)).collect();
+        assert_matches_exact(&engine, &queries, 7, "mutated");
+
+        let restored = load(&engine.serialize(true).expect("serialize")).expect("load");
+        assert_matches_exact(&restored, &queries, 7, "restored");
+        for query in &queries {
+            assert_eq!(
+                engine.search(query, 7).neighbors,
+                restored.search(query, 7).neighbors
+            );
+        }
+    }
+
+    #[test]
+    fn pruned_search_skips_cells_on_clustered_data() {
+        let data = clustered(8000, 32, 64, 0.05, 0x99);
+        let engine = Engine::build(&data, &ids_of(8000), options()).expect("build");
+
+        let outcome = engine.search(&data[123], 10);
+        assert!(outcome.exact);
+        assert!(
+            outcome.candidates_scored < 8000 / 4,
+            "scored {} of 8000 rows; the bound should prune most cells",
+            outcome.candidates_scored
+        );
+    }
+
+    #[test]
+    fn training_lays_cells_out_contiguously() {
+        let engine = Engine::build(&corpus(1000, 8), &ids_of(1000), options()).expect("build");
+        let mut next = 0u32;
+        for list in &engine.ivf.lists {
+            for &row in list {
+                assert_eq!(row, next, "cells should be consecutive runs of rows");
+                next += 1;
+            }
+        }
+        assert_eq!(next as usize, engine.len());
+        // And the ids moved with their vectors.
+        let data = corpus(1000, 8);
+        for i in [0usize, 17, 999] {
+            assert_eq!(
+                engine.search(&data[i], 1).neighbors[0].id,
+                format!("id-{i}")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_non_finite_vectors() {
+        let mut engine = Engine::new(IndexOptions::default());
+
+        // REGRESSION: `add("a", [])` then `add("b", v)` used to replace the
+        // store under "a", so "b" was filed on row 1 while its vector sat on
+        // row 0, and the next snapshot could not be read back.
+        assert!(engine.add("a".into(), &[]).is_err());
+        assert!(engine.add("nan".into(), &[0.0, f32::NAN]).is_err());
+        assert!(engine.add("inf".into(), &[f32::INFINITY, 0.0]).is_err());
+        assert_eq!(engine.len(), 0);
+        assert_eq!(engine.dim(), 0);
+
+        engine.add("b".into(), &[1.0, 2.0]).expect("add");
+        assert_eq!(engine.search(&[1.0, 2.0], 1).neighbors[0].id, "b");
+        let restored = load(&engine.serialize(true).expect("serialize")).expect("load");
+        assert_eq!(restored.len(), 1);
+
+        // A non-finite query has no neighbours rather than garbage ones.
+        assert!(engine.search(&[f32::NAN, 0.0], 1).neighbors.is_empty());
+        assert!(
+            engine
+                .search_exact(&[0.0, f32::INFINITY], 1)
+                .neighbors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remove_and_add_many_are_atomic() {
+        let mut engine = Engine::build(&corpus(10, 4), &ids_of(10), options()).expect("build");
+
+        // One unknown id: nothing is removed.
+        assert!(
+            engine
+                .remove(&["id-1".to_string(), "missing".to_string()])
+                .is_err()
+        );
+        assert_eq!(engine.len(), 10);
+        assert!(engine.contains("id-1"));
+
+        // Repeating an id inside one call removes it once, without an error.
+        engine
+            .remove(&["id-2".to_string(), "id-2".to_string()])
+            .expect("remove");
+        assert_eq!(engine.len(), 9);
+
+        // A bad item anywhere in a batch: nothing is added.
+        let batch = vec![
+            ("new-1".to_string(), vec![0.0; 4]),
+            ("new-2".to_string(), vec![0.0; 3]),
+        ];
+        assert!(engine.add_many(&batch).is_err());
+        assert!(!engine.contains("new-1"));
+        let batch = vec![
+            ("dup".to_string(), vec![0.0; 4]),
+            ("dup".to_string(), vec![1.0; 4]),
+        ];
+        assert!(engine.add_many(&batch).is_err());
+        assert!(!engine.contains("dup"));
+        assert_eq!(engine.len(), 9);
+    }
+
+    #[test]
+    fn huge_k_is_clamped() {
+        for threshold in [256usize, usize::MAX] {
+            let engine = Engine::build(
+                &corpus(300, 8),
+                &ids_of(300),
+                IndexOptions {
+                    ivf_threshold: threshold,
+                    ..Default::default()
+                },
+            )
+            .expect("build");
+            for k in [301usize, usize::MAX >> 2, usize::MAX] {
+                assert_eq!(engine.search(&[0.0; 8], k).neighbors.len(), 300);
+                assert_eq!(engine.search_exact(&[0.0; 8], k).neighbors.len(), 300);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_ids_in_a_snapshot_keep_ids_on_their_vectors() {
+        // REGRESSION: `IdMap::from_ids` skipped a repeated id without leaving
+        // a slot, so every later id moved onto the previous row's vector.
+        let snapshot = Snapshot {
+            distance: Distance::Euclidean,
+            dim: 2,
+            count: 3,
+            data: vec![0.0, 0.0, 5.0, 5.0, 9.0, 9.0],
+            cache: vec![0.0; 3],
+            ids: vec!["a".into(), "a".into(), "b".into()],
+            ..Snapshot::default()
+        };
+        let engine = Engine::from_snapshot(snapshot, IndexOptions::default()).expect("load");
+
+        assert_eq!(engine.len(), 2);
+        assert_eq!(engine.dead_rows(), 0, "the duplicate is swept on load");
+        assert_eq!(engine.search(&[9.0, 9.0], 1).neighbors[0].id, "b");
+        assert_eq!(engine.search(&[0.0, 0.0], 1).neighbors[0].id, "a");
+    }
+
+    #[test]
+    fn inconsistent_snapshots_are_errors_not_panics() {
+        let base = || {
+            let engine = Engine::build(&corpus(400, 8), &ids_of(400), options()).expect("build");
+            engine.to_snapshot()
+        };
+
+        let mut wrong_lists = base();
+        wrong_lists.lists.push(Vec::new());
+        assert!(Engine::from_snapshot(wrong_lists, IndexOptions::default()).is_err());
+
+        let mut zero_dim = base();
+        zero_dim.dim = 0;
+        zero_dim.data.clear();
+        assert!(Engine::from_snapshot(zero_dim, IndexOptions::default()).is_err());
+
+        let mut bad_pq = base();
+        bad_pq.pq = Some(PqSnapshot {
+            m: 1,
+            ksub: u32::MAX,
+            subvector_dim: 0,
+            codebooks: Vec::new(),
+        });
+        bad_pq.codes = vec![0; 400];
+        assert!(Engine::from_snapshot(bad_pq, IndexOptions::default()).is_err());
+
+        let mut nan = base();
+        nan.data[3] = f32::NAN;
+        assert!(Engine::from_snapshot(nan, IndexOptions::default()).is_err());
+
+        // A list that misses a row is repaired by re-filing, not trusted.
+        let mut missing_row = base();
+        let victim = missing_row
+            .lists
+            .iter()
+            .position(|l| !l.is_empty())
+            .expect("a non-empty list");
+        let dropped = missing_row.lists[victim].remove(0);
+        let engine = Engine::from_snapshot(missing_row, IndexOptions::default()).expect("load");
+        let data = corpus(400, 8);
+        let id = engine
+            .ids
+            .id_of(dropped as usize)
+            .expect("live")
+            .to_string();
+        let row = id
+            .trim_start_matches("id-")
+            .parse::<usize>()
+            .expect("index");
+        assert_eq!(engine.search(&data[row], 1).neighbors[0].id, id);
+    }
+
+    #[test]
+    fn load_honours_the_callers_nprobe() {
+        let engine = Engine::build(&corpus(2000, 8), &ids_of(2000), options()).expect("build");
+        let bytes = engine.serialize(false).expect("serialize");
+
+        let tuned = load_with_options(
+            &bytes,
+            IndexOptions {
+                nprobe: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("load");
+        assert_eq!(tuned.nprobe(), 3);
+
+        let default = load(&bytes).expect("load");
+        assert_eq!(default.nprobe(), engine.nprobe());
+    }
+
+    #[test]
+    fn approximate_dot_product_finds_large_norm_winners() {
+        // Ranking cells by distance to the centroid, as the approximate path
+        // used to for every metric, never probes the cell holding a far-away,
+        // large-norm vector — which is exactly the dot-product winner.
+        let mut data = corpus(3000, 8);
+        let mut ids = ids_of(3000);
+        data.push(vec![50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        ids.push("giant".into());
+
+        let engine = Engine::build(
+            &data,
+            &ids,
+            IndexOptions {
+                distance: Distance::DotProduct,
+                ivf_threshold: 256,
+                approximate: true,
+                nprobe: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("build");
+
+        let outcome = engine.search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1);
+        assert_eq!(outcome.neighbors[0].id, "giant");
+    }
+
+    #[test]
+    fn compaction_rebases_the_retrain_baseline() {
+        let mut engine = Engine::build(&corpus(1000, 8), &ids_of(1000), options()).expect("build");
+        assert_eq!(engine.rows_at_last_train, 1000);
+
+        engine
+            .remove(&(0..400).map(|i| format!("id-{i}")).collect::<Vec<_>>())
+            .expect("remove");
+        assert_eq!(engine.dead_rows(), 0, "40% dead compacts");
+        assert_eq!(engine.rows_at_last_train, 600);
     }
 
     #[test]

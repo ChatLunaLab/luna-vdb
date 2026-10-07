@@ -156,10 +156,13 @@ jobs:
         run: wasm-pack test --headless --chrome -- --features console_error_panic_hook
 
       - name: Verify the SIMD section is present
-        # The mirror of the scalar check: this build must actually contain
-        # vector instructions. If a refactor accidentally routes the SIMD
-        # configuration to the scalar kernels, the tests still pass and only
-        # this catches it.
+        # The mirror of the scalar check: this build must contain vector
+        # instructions at all. On its own it cannot prove the hand-written
+        # kernels are linked in — at opt-level 3 with +simd128, LLVM
+        # autovectorises ordinary loops elsewhere into the same opcodes. The
+        # check that the SIMD *kernels* are in use is `test_simd_backend_is_known`
+        # in the wasm suite above: the backend name comes from the kernel module
+        # that is compiled in, and must be "wasm-simd128" in this job.
         run: |
           cargo install wasm-tools --locked
           wasm-tools print "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/luna_vdb.wasm" > module.wat
@@ -169,8 +172,30 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Package: build the published artifacts and run the JS-level smoke test
-  # against them, including the legacy-snapshot import path.
+  # Legacy import: snapshots written by the real pre-rewrite engine (commit
+  # ca10590, linked as a second dependency) must load and answer correctly.
+  # The codec's unit tests only prove the decoder agrees with a hand-copied
+  # mirror of the old structs; this proves the mirror agrees with reality.
+  # ---------------------------------------------------------------------------
+  legacy-import:
+    name: Legacy snapshot import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compare
+
+      - name: Import snapshots written by the pre-rewrite engine
+        run: cargo test --release --manifest-path compare/Cargo.toml
+
+  # ---------------------------------------------------------------------------
+  # Package: build the published artifacts and run the JS-level smoke tests
+  # against them.
   # ---------------------------------------------------------------------------
   package:
     name: Package smoke test

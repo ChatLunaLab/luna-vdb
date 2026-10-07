@@ -34,7 +34,15 @@ function test(name, fn) {
 const dim = 8
 
 function vector(seed) {
-  let state = (seed | 1) >>> 0
+  // Mix the seed first (murmur3's finaliser, a bijection on 32 bits). The
+  // obvious `seed | 1` maps 2n and 2n + 1 to the same state, so every corpus
+  // used to contain identical twin vectors, and a "nearest neighbour is
+  // itself" check only tested which twin the tie-break happened to prefer.
+  let state = Math.imul(seed ^ 0x9e3779b9, 0x85ebca6b) >>> 0
+  state ^= state >>> 13
+  state = Math.imul(state, 0xc2b2ae35) >>> 0
+  state ^= state >>> 16
+  if (state === 0) state = 1
   const out = new Float32Array(dim)
   for (let i = 0; i < dim; i += 1) {
     state ^= state << 13
@@ -345,6 +353,110 @@ test('searchExact is exact', () => {
   assert.equal(exact.exact, true)
   assert.equal(exact.scanned, 1000)
   assert.equal(exact.neighbors[0].id, 'e4')
+})
+
+test('default search is exact', () => {
+  const db = new LunaVDB({ ivfThreshold: 256 })
+  db.index(makeResource(3000, 'x'))
+  assert.ok(db.stats().indexed)
+
+  for (const seed of [10_001, 10_002, 10_003, 10_004, 10_005]) {
+    const query = Array.from(vector(seed))
+    const fast = db.search(query, 10)
+    const slow = db.searchExact(query, 10)
+    assert.equal(fast.exact, true)
+    assert.deepEqual(fast.neighbors.map((n) => n.id), slow.neighbors.map((n) => n.id))
+  }
+})
+
+test('approximate mode is opt-in and says so', () => {
+  const db = new LunaVDB({ ivfThreshold: 256, approximate: true, nprobe: 2 })
+  db.index(makeResource(3000, 'a'))
+  const result = db.search(Array.from(vector(7)), 10)
+  assert.equal(result.exact, false)
+  assert.ok(result.scanned < 3000)
+  assert.equal(db.stats().approximate, true)
+})
+
+test('a malformed argument throws and does not lock the handle', () => {
+  // REGRESSION: wasm-bindgen held the handle's borrow while converting the
+  // argument, and a failed conversion never released it — every later call
+  // threw "recursive use of an object detected", and free() failed too.
+  const db = new LunaVDB()
+  db.add(makeResource(5))
+
+  assert.throws(() => db.add({ embeddings: [{ id: 42, embeddings: [1, 2, 3, 4, 5, 6, 7, 8] }] }), TypeError)
+  assert.throws(() => db.add('not a resource'), TypeError)
+  assert.throws(() => db.add(undefined), TypeError)
+  assert.throws(() => db.index(null), TypeError)
+  assert.throws(() => db.remove('v0'), TypeError)
+  assert.throws(() => db.remove([1, 2]), TypeError)
+  assert.throws(() => db.restoreInto('bytes'), TypeError)
+  assert.throws(() => db.search([NaN, 0, 0, 0, 0, 0, 0, 0], 1), TypeError)
+
+  // Every kind of call still works on the same handle — and it can be freed.
+  assert.equal(db.size(), 5)
+  assert.equal(db.search(Array.from(vector(1)), 2).neighbors.length, 2)
+  db.add({ embeddings: [{ id: 'late', embeddings: Array.from(vector(77)) }] })
+  db.remove(['late'])
+  db.clear()
+  assert.equal(db.size(), 0)
+  db.free()
+})
+
+test('batches are all-or-nothing', () => {
+  const db = new LunaVDB()
+  db.add(makeResource(3))
+
+  const batch = makeResource(4, 'b')
+  batch.embeddings[2].embeddings = [1, 2, 3]
+  assert.throws(() => db.add(batch), /dimension mismatch/)
+  assert.equal(db.size(), 3)
+  assert.ok(!db.has('b0'), 'items before the bad one must not be kept')
+
+  assert.throws(() => db.remove(['v0', 'missing']), /not found/)
+  assert.ok(db.has('v0'), 'nothing is removed when one id is unknown')
+})
+
+test('k larger than the corpus, or negative, is clamped', () => {
+  const db = new LunaVDB()
+  db.add(makeResource(4))
+  assert.equal(db.search(Array.from(vector(1)), 1000).neighbors.length, 4)
+  // -1 crosses the boundary as 2^32 - 1.
+  assert.equal(db.search(Array.from(vector(1)), -1).neighbors.length, 4)
+})
+
+test('deserialize accepts an ArrayBuffer and a Buffer', () => {
+  // REGRESSION: an ArrayBuffer has no `length`, so the old binding read it as
+  // zero bytes and called a valid snapshot truncated.
+  const db = new LunaVDB({ distance: 'cosine' })
+  db.index(makeResource(40, 'ab'))
+  const bytes = db.serialize()
+  const exact = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+
+  assert.equal(LunaVDB.deserialize(exact).size(), 40)
+  assert.equal(LunaVDB.deserialize(Buffer.from(bytes)).size(), 40)
+  assert.ok(isSnapshot(exact))
+
+  const target = new LunaVDB()
+  target.restoreInto(exact)
+  assert.equal(target.size(), 40)
+  // The metric comes from the snapshot and survives a rebuild.
+  target.index(makeResource(5, 'z'))
+  assert.equal(target.distance(), 'cosine')
+
+  assert.throws(() => LunaVDB.deserialize(42), TypeError)
+})
+
+test('every header byte is covered by the checksum', () => {
+  const db = new LunaVDB()
+  db.index(makeResource(30, 'h'))
+  const good = db.serialize()
+  for (let offset = 4; offset < 16; offset += 1) {
+    const bad = good.slice()
+    bad[offset] ^= 0x01
+    assert.throws(() => LunaVDB.deserialize(bad), Error, `flip at ${offset}`)
+  }
 })
 
 test('helpers report format information', () => {

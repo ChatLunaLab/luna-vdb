@@ -3,9 +3,13 @@
 //! Layout:
 //! * [`engine`] — pure-Rust core. No wasm-bindgen, no JS. Usable from native
 //!   Rust, and the only place where the algorithms live.
-//! * [`wasm`] — the JS-facing surface. Every fallible entry point returns
-//!   `Result<_, JsValue>`; nothing here unwraps, so a bad call surfaces as a
-//!   catchable JS exception instead of a poisoned wasm instance.
+//! * `wasm` — the JS-facing surface, compiled only for `wasm32`. Every
+//!   fallible entry point returns `Result<_, JsValue>`; nothing there unwraps,
+//!   so a bad call surfaces as a catchable JS exception instead of a poisoned
+//!   wasm instance. It is not built for native targets at all: `JsValue`
+//!   needs a JS host, and on a native target constructing one aborts the
+//!   process, so a native `LunaVDB` could only ever fail by crashing. Native
+//!   Rust callers use [`engine::Engine`] directly.
 //!
 //! # Panic policy
 //!
@@ -26,17 +30,22 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod engine;
+#[cfg(target_arch = "wasm32")]
 mod utils;
+#[cfg(target_arch = "wasm32")]
 mod wasm;
 
 pub use engine::{Distance, EngineError};
+#[cfg(target_arch = "wasm32")]
 pub use wasm::*;
 
-/// Which SIMD backend was compiled in. Useful when filing perf issues.
+/// Which SIMD backend is running. Useful when filing perf issues.
 ///
-/// Possible values: `"wasm-simd128"`, `"avx2"`, `"neon"`, `"scalar"`.
+/// Possible values: `"wasm-simd128"`, `"avx2"`, `"neon"`, `"scalar"`. On
+/// x86_64 this reflects the runtime CPU check, so an AVX2 build running on a
+/// CPU without AVX2 reports `"scalar"`.
 pub fn simd_backend() -> &'static str {
-    engine::simd::KERNEL_NAME
+    engine::simd::backend_name()
 }
 
 /// `true` when the wasm module was compiled with SIMD128 enabled.
@@ -47,4 +56,21 @@ pub fn simd_backend() -> &'static str {
 /// `@chatluna/luna-vdb/scalar` instead.
 pub fn has_simd() -> bool {
     cfg!(target_feature = "simd128")
+}
+
+/// This crate's version.
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// `true` if `bytes` starts like a snapshot this build can read. See
+/// [`engine::codec::is_snapshot`].
+pub fn is_snapshot(bytes: &[u8]) -> bool {
+    engine::codec::is_snapshot(bytes)
+}
+
+/// Format version of a snapshot, `0` if unrecognised. See
+/// [`engine::codec::snapshot_version`].
+pub fn snapshot_version(bytes: &[u8]) -> u16 {
+    engine::codec::snapshot_version(bytes)
 }

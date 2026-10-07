@@ -193,10 +193,20 @@ impl VectorStore {
         self.cache.clear();
     }
 
-    /// Drop every row listed in `keep` (a sorted, deduplicated list of row
-    /// indices), preserving order. Used by compaction.
+    /// Rebuild the arena from the rows listed in `keep`, in that order.
+    ///
+    /// `keep[i]` is the old row that becomes row `i`. Rows not listed are
+    /// dropped; the order may differ from the old one, which is how the engine
+    /// lays rows out cell by cell. Used by compaction and by training.
     pub fn retain_rows(&mut self, keep: &[u32]) {
-        if keep.len() == self.rows() {
+        // Only an identity keep list is a no-op. Comparing lengths alone, as
+        // this used to, silently ignored every pure reordering.
+        let identity = keep.len() == self.rows()
+            && keep
+                .iter()
+                .enumerate()
+                .all(|(new, &old)| old as usize == new);
+        if identity {
             return;
         }
 

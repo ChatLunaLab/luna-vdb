@@ -26,11 +26,23 @@ cd "$(dirname "$0")/.."
 TARGET=wasm32-unknown-unknown
 ARTIFACT="target/${TARGET}/release/luna_vdb.wasm"
 
+# The CLI must match the `wasm-bindgen` crate *exactly*, or the generated glue
+# is rejected at load time. The version that matters is the one Cargo.lock
+# resolved, not the lower bound written in Cargo.toml.
+WASM_BINDGEN_VERSION="$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' Cargo.lock)"
+
 command -v wasm-bindgen >/dev/null 2>&1 || {
   echo "error: wasm-bindgen CLI not found. Install with:" >&2
-  echo "  cargo install wasm-bindgen-cli --version \$(grep -m1 '^wasm-bindgen = ' Cargo.toml | cut -d'\"' -f2)" >&2
+  echo "  cargo install wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION}" >&2
   exit 1
 }
+
+installed="$(wasm-bindgen --version | awk '{ print $2 }')"
+if [ "$installed" != "$WASM_BINDGEN_VERSION" ]; then
+  echo "error: wasm-bindgen CLI is ${installed}, but Cargo.lock pins the crate at ${WASM_BINDGEN_VERSION}." >&2
+  echo "  cargo install wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION}" >&2
+  exit 1
+fi
 
 rustup target list --installed | grep -q "^${TARGET}$" || rustup target add "$TARGET"
 

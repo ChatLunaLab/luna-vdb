@@ -24,7 +24,8 @@
 //! | `aarch64`                           | `neon`       |
 //! | anything else                       | `scalar`     |
 //!
-//! `simd_backend()` in the crate root reports which one is live.
+//! [`backend_name`] (`simd_backend()` in the crate root) reports which one is
+//! live.
 //!
 //! # Accuracy
 //!
@@ -34,29 +35,15 @@
 //! for equality across targets. Within one build the order is deterministic,
 //! so a snapshot round-trip is exact.
 
-/// Which kernel implementation is compiled in. See the module docs.
-pub const KERNEL_NAME: &str = {
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        "wasm-simd128"
-    }
-    #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
-    {
-        "avx2"
-    }
-    #[cfg(all(target_arch = "aarch64", not(target_arch = "wasm32")))]
-    {
-        "neon"
-    }
-    #[cfg(not(any(
-        all(target_arch = "wasm32", target_feature = "simd128"),
-        all(target_arch = "x86_64", not(target_arch = "wasm32")),
-        all(target_arch = "aarch64", not(target_arch = "wasm32")),
-    )))]
-    {
-        "scalar"
-    }
-};
+/// Which kernel is actually running. See the module docs.
+///
+/// Each backend module reports its own name, so the label cannot disagree with
+/// the code that runs: on x86_64 the answer comes from the same runtime check
+/// that selects AVX2 or the scalar fallback, and a build that routed the
+/// SIMD128 configuration to the scalar kernels would say `"scalar"`.
+pub fn backend_name() -> &'static str {
+    imp::name()
+}
 
 // ---------------------------------------------------------------------------
 // Scalar reference
@@ -169,6 +156,10 @@ mod imp {
     use core::arch::wasm32::{
         f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_splat, f32x4_sub, v128, v128_load,
     };
+
+    pub fn name() -> &'static str {
+        "wasm-simd128"
+    }
 
     /// Horizontal sum of four lanes.
     #[inline]
@@ -339,6 +330,10 @@ mod imp {
         };
         LEVEL.store(detected, Ordering::Relaxed);
         detected
+    }
+
+    pub fn name() -> &'static str {
+        if level() == AVX2 { "avx2" } else { "scalar" }
     }
 
     #[inline]
@@ -574,6 +569,10 @@ mod imp {
 mod imp {
     use core::arch::aarch64::*;
 
+    pub fn name() -> &'static str {
+        "neon"
+    }
+
     #[inline]
     fn hadd(v: float32x4_t) -> f32 {
         // SAFETY: pure register arithmetic, no memory access.
@@ -688,6 +687,10 @@ mod imp {
     all(target_arch = "aarch64", not(target_arch = "wasm32")),
 )))]
 mod imp {
+    pub fn name() -> &'static str {
+        "scalar"
+    }
+
     #[inline]
     pub fn dot(a: &[f32], b: &[f32]) -> f32 {
         super::scalar_dot(a, b)
@@ -733,9 +736,13 @@ pub fn norm_sq(v: &[f32]) -> f32 {
 }
 
 /// Euclidean distance, `sqrt(l2_sq(a, b))`.
+///
+/// No `.max(0.0)` before the root: `l2_sq` is a sum of squares and cannot be
+/// negative, and `f32::max` returns the *other* operand for a NaN — so the
+/// clamp did nothing except turn a NaN distance into 0.0, a perfect match.
 #[inline]
 pub fn l2(a: &[f32], b: &[f32]) -> f32 {
-    l2_sq(a, b).max(0.0).sqrt()
+    l2_sq(a, b).sqrt()
 }
 
 /// All three metrics in one call. `cache_a`/`cache_b` are the precomputed
@@ -757,23 +764,45 @@ pub fn score(
         crate::engine::types::Distance::Cosine => {
             // Cache holds the squared norm, so the magnitude is its sqrt.
             let denom = cache_a.max(0.0).sqrt() * cache_b.max(0.0).sqrt();
-            if denom <= f32::MIN_POSITIVE {
+            if denom.is_nan() || denom <= f32::MIN_POSITIVE {
                 // A zero vector has no direction; treat everything as maximally
                 // distant rather than producing a NaN that would poison the
                 // ordering.
                 1.0
             } else {
-                (1.0 - dot(a, b) / denom).clamp(-1.0, 2.0)
+                let value = 1.0 - dot(a, b) / denom;
+                // `inf / inf` when the norms overflow; `clamp` passes NaN
+                // through, so it has to be caught first.
+                if value.is_nan() {
+                    1.0
+                } else {
+                    value.clamp(0.0, 2.0)
+                }
             }
         }
     }
 }
 
-/// Scale `v` to unit length in place. A zero (or subnormal) vector is left
-/// untouched rather than being turned into NaNs.
+/// Scale `v` to unit length in place. A zero vector is left untouched rather
+/// than being turned into NaNs.
+///
+/// The vector is first divided by its largest component, so the sum of squares
+/// lies in `[1, len]` whatever the input magnitude. Squaring the raw values
+/// overflowed to `inf` above about `1.8e19` per component — and `1 / inf`
+/// then zeroed the vector — and underflowed to `0` below about `1e-23`, which
+/// left the vector un-normalised.
 pub fn normalize_in_place(v: &mut [f32]) {
-    let magnitude = norm_sq(v).max(0.0).sqrt();
-    if magnitude > f32::MIN_POSITIVE {
+    let largest = v.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+    if largest == 0.0 || !largest.is_finite() {
+        return;
+    }
+
+    for value in v.iter_mut() {
+        *value /= largest;
+    }
+
+    let magnitude = norm_sq(v).sqrt();
+    if magnitude > 0.0 && magnitude.is_finite() {
         let inv = 1.0 / magnitude;
         for value in v.iter_mut() {
             *value *= inv;
@@ -876,6 +905,40 @@ mod tests {
         let mut v = vec![3.0f32, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         normalize_in_place(&mut v);
         assert_close(norm_sq(&v), 1.0, 8);
+    }
+
+    #[test]
+    fn normalize_survives_extreme_magnitudes() {
+        // REGRESSION: squaring 3e19 overflowed, `1 / inf` zeroed the vector,
+        // and a Cosine row lost its direction entirely.
+        let mut huge = vec![3e19f32, 4e19, 0.0, 0.0];
+        normalize_in_place(&mut huge);
+        assert_close(huge[0], 0.6, 4);
+        assert_close(huge[1], 0.8, 4);
+
+        // REGRESSION: squaring 1e-23 underflowed to 0 and the vector was left
+        // as it was.
+        let mut tiny = vec![3e-23f32, 4e-23, 0.0, 0.0];
+        normalize_in_place(&mut tiny);
+        assert_close(norm_sq(&tiny), 1.0, 4);
+    }
+
+    #[test]
+    fn nan_distance_is_not_a_perfect_match() {
+        // REGRESSION: `l2_sq(..).max(0.0)` mapped NaN to 0.0.
+        let a = [f32::NAN, 0.0, 0.0, 0.0];
+        let b = [0.0f32; 4];
+        assert!(l2(&a, &b).is_nan());
+
+        use crate::engine::types::Distance;
+        let big = vec![2e19f32, 0.0, 0.0, 0.0];
+        let s = score(Distance::Cosine, &big, &big, norm_sq(&big), norm_sq(&big));
+        assert!(!s.is_nan());
+    }
+
+    #[test]
+    fn backend_name_is_known() {
+        assert!(["wasm-simd128", "avx2", "neon", "scalar"].contains(&backend_name()));
     }
 
     #[test]
