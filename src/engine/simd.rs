@@ -79,10 +79,10 @@ pub fn scalar_dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc2 = 0.0f32;
     let mut acc3 = 0.0f32;
 
-    let mut chunks = a.chunks_exact(4);
-    let mut b_chunks = b.chunks_exact(4);
+    let (chunks, a_rest) = a.as_chunks::<4>();
+    let (b_chunks, b_rest) = b.as_chunks::<4>();
 
-    for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (x, y) in chunks.iter().zip(b_chunks) {
         acc0 += x[0] * y[0];
         acc1 += x[1] * y[1];
         acc2 += x[2] * y[2];
@@ -90,7 +90,7 @@ pub fn scalar_dot(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let mut total = (acc0 + acc1) + (acc2 + acc3);
-    for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a_rest.iter().zip(b_rest) {
         total += x * y;
     }
     total
@@ -107,10 +107,10 @@ pub fn scalar_l2_sq(a: &[f32], b: &[f32]) -> f32 {
     let mut acc2 = 0.0f32;
     let mut acc3 = 0.0f32;
 
-    let mut chunks = a.chunks_exact(4);
-    let mut b_chunks = b.chunks_exact(4);
+    let (chunks, a_rest) = a.as_chunks::<4>();
+    let (b_chunks, b_rest) = b.as_chunks::<4>();
 
-    for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (x, y) in chunks.iter().zip(b_chunks) {
         let d0 = x[0] - y[0];
         let d1 = x[1] - y[1];
         let d2 = x[2] - y[2];
@@ -122,7 +122,7 @@ pub fn scalar_l2_sq(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let mut total = (acc0 + acc1) + (acc2 + acc3);
-    for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (x, y) in a_rest.iter().zip(b_rest) {
         let d = x - y;
         total += d * d;
     }
@@ -136,8 +136,8 @@ pub fn scalar_norm_sq(a: &[f32]) -> f32 {
     let mut acc2 = 0.0f32;
     let mut acc3 = 0.0f32;
 
-    let mut chunks = a.chunks_exact(4);
-    for x in chunks.by_ref() {
+    let (chunks, rest) = a.as_chunks::<4>();
+    for x in chunks {
         acc0 += x[0] * x[0];
         acc1 += x[1] * x[1];
         acc2 += x[2] * x[2];
@@ -145,7 +145,7 @@ pub fn scalar_norm_sq(a: &[f32]) -> f32 {
     }
 
     let mut total = (acc0 + acc1) + (acc2 + acc3);
-    for &x in chunks.remainder() {
+    for &x in rest {
         total += x * x;
     }
     total
@@ -182,7 +182,7 @@ mod imp {
     #[inline]
     fn load16(ptr: *const f32) -> v128 {
         // SAFETY: caller guarantees 16 readable bytes at `ptr`. Every call site
-        // passes a pointer into a `chunks_exact(4 or 8 or 16)` slice, so the
+        // passes a pointer into a `as_chunks::<4>()` result, so the
         // four lanes are always in bounds.
         unsafe { v128_load(ptr as *const v128) }
     }
@@ -215,10 +215,10 @@ mod imp {
         let mut acc2 = zero();
         let mut acc3 = zero();
 
-        let mut chunks = a[..len].chunks_exact(16);
-        let mut b_chunks = b[..len].chunks_exact(16);
+        let (chunks, a_rest) = a[..len].as_chunks::<16>();
+        let (b_chunks, b_rest) = b[..len].as_chunks::<16>();
 
-        for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+        for (x, y) in chunks.iter().zip(b_chunks) {
             // SAFETY: each chunk is exactly 16 f32 and offsets 0/4/8/12 stay
             // inside it, so all four 16-byte loads are in bounds. The pointer
             // offsets themselves are the only unsafe arithmetic here; the
@@ -241,7 +241,7 @@ mod imp {
         }
 
         let mut total = hadd(add(add(acc0, acc1), add(acc2, acc3)));
-        for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+        for (x, y) in a_rest.iter().zip(b_rest) {
             total += x * y;
         }
         total
@@ -253,10 +253,10 @@ mod imp {
         let mut acc0 = zero();
         let mut acc1 = zero();
 
-        let mut chunks = a[..len].chunks_exact(8);
-        let mut b_chunks = b[..len].chunks_exact(8);
+        let (chunks, a_rest) = a[..len].as_chunks::<8>();
+        let (b_chunks, b_rest) = b[..len].as_chunks::<8>();
 
-        for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+        for (x, y) in chunks.iter().zip(b_chunks) {
             // SAFETY: each chunk is exactly 8 f32; offsets 0 and 4 are both
             // inside it.
             unsafe {
@@ -273,7 +273,7 @@ mod imp {
         }
 
         let mut total = hadd(add(acc0, acc1));
-        for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+        for (x, y) in a_rest.iter().zip(b_rest) {
             let d = x - y;
             total += d * d;
         }
@@ -285,8 +285,8 @@ mod imp {
         let mut acc0 = zero();
         let mut acc1 = zero();
 
-        let mut chunks = a.chunks_exact(8);
-        for x in chunks.by_ref() {
+        let (chunks, rest) = a.as_chunks::<8>();
+        for x in chunks {
             // SAFETY: each chunk is exactly 8 f32; offsets 0 and 4 are inside.
             unsafe {
                 let v0 = load16(x.as_ptr());
@@ -298,7 +298,7 @@ mod imp {
         }
 
         let mut total = hadd(add(acc0, acc1));
-        for &x in chunks.remainder() {
+        for &x in rest {
             total += x * x;
         }
         total
@@ -448,10 +448,10 @@ mod imp {
             let mut acc2 = zero();
             let mut acc3 = zero();
 
-            let mut chunks = a[..len].chunks_exact(32);
-            let mut b_chunks = b[..len].chunks_exact(32);
+            let (chunks, a_rest) = a[..len].as_chunks::<32>();
+            let (b_chunks, b_rest) = b[..len].as_chunks::<32>();
 
-            for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+            for (x, y) in chunks.iter().zip(b_chunks) {
                 let xp = x.as_ptr();
                 let yp = y.as_ptr();
 
@@ -463,7 +463,7 @@ mod imp {
 
             let combined = add(add(acc0, acc1), add(acc2, acc3));
             let mut total = hsum_ps(combined);
-            for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+            for (x, y) in a_rest.iter().zip(b_rest) {
                 total += x * y;
             }
             total
@@ -481,10 +481,10 @@ mod imp {
             let mut acc2 = zero();
             let mut acc3 = zero();
 
-            let mut chunks = a[..len].chunks_exact(32);
-            let mut b_chunks = b[..len].chunks_exact(32);
+            let (chunks, a_rest) = a[..len].as_chunks::<32>();
+            let (b_chunks, b_rest) = b[..len].as_chunks::<32>();
 
-            for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+            for (x, y) in chunks.iter().zip(b_chunks) {
                 let xp = x.as_ptr();
                 let yp = y.as_ptr();
 
@@ -508,7 +508,7 @@ mod imp {
 
             let combined = add(add(acc0, acc1), add(acc2, acc3));
             let mut total = hsum_ps(combined);
-            for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+            for (x, y) in a_rest.iter().zip(b_rest) {
                 let d = x - y;
                 total += d * d;
             }
@@ -525,8 +525,8 @@ mod imp {
             let mut acc2 = zero();
             let mut acc3 = zero();
 
-            let mut chunks = a.chunks_exact(32);
-            for x in chunks.by_ref() {
+            let (chunks, rest) = a.as_chunks::<32>();
+            for x in chunks {
                 let xp = x.as_ptr();
 
                 let v0 = loadu(xp);
@@ -541,7 +541,7 @@ mod imp {
 
             let combined = add(add(acc0, acc1), add(acc2, acc3));
             let mut total = hsum_ps(combined);
-            for &x in chunks.remainder() {
+            for &x in rest {
                 total += x * x;
             }
             total
@@ -592,10 +592,10 @@ mod imp {
         let mut acc2 = unsafe { vdupq_n_f32(0.0) };
         let mut acc3 = unsafe { vdupq_n_f32(0.0) };
 
-        let mut chunks = a[..len].chunks_exact(16);
-        let mut b_chunks = b[..len].chunks_exact(16);
+        let (chunks, a_rest) = a[..len].as_chunks::<16>();
+        let (b_chunks, b_rest) = b[..len].as_chunks::<16>();
 
-        for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+        for (x, y) in chunks.iter().zip(b_chunks) {
             // SAFETY: 16 f32 = 64 bytes available in each chunk.
             unsafe {
                 acc0 = vfmaq_f32(acc0, vld1q_f32(x.as_ptr()), vld1q_f32(y.as_ptr()));
@@ -619,7 +619,7 @@ mod imp {
 
         // SAFETY: register arithmetic only.
         let mut total = unsafe { hadd(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3))) };
-        for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+        for (x, y) in a_rest.iter().zip(b_rest) {
             total += x * y;
         }
         total
@@ -631,10 +631,10 @@ mod imp {
         let mut acc0 = unsafe { vdupq_n_f32(0.0) };
         let mut acc1 = unsafe { vdupq_n_f32(0.0) };
 
-        let mut chunks = a[..len].chunks_exact(8);
-        let mut b_chunks = b[..len].chunks_exact(8);
+        let (chunks, a_rest) = a[..len].as_chunks::<8>();
+        let (b_chunks, b_rest) = b[..len].as_chunks::<8>();
 
-        for (x, y) in chunks.by_ref().zip(b_chunks.by_ref()) {
+        for (x, y) in chunks.iter().zip(b_chunks) {
             // SAFETY: 8 f32 = 32 bytes available in each chunk.
             unsafe {
                 let d0 = vsubq_f32(vld1q_f32(x.as_ptr()), vld1q_f32(y.as_ptr()));
@@ -646,7 +646,7 @@ mod imp {
 
         // SAFETY: register arithmetic only.
         let mut total = unsafe { hadd(vaddq_f32(acc0, acc1)) };
-        for (x, y) in chunks.remainder().iter().zip(b_chunks.remainder()) {
+        for (x, y) in a_rest.iter().zip(b_rest) {
             let d = x - y;
             total += d * d;
         }
@@ -658,8 +658,8 @@ mod imp {
         let mut acc0 = unsafe { vdupq_n_f32(0.0) };
         let mut acc1 = unsafe { vdupq_n_f32(0.0) };
 
-        let mut chunks = a.chunks_exact(8);
-        for x in chunks.by_ref() {
+        let (chunks, rest) = a.as_chunks::<8>();
+        for x in chunks {
             // SAFETY: 8 f32 = 32 bytes available in this chunk.
             unsafe {
                 let v0 = vld1q_f32(x.as_ptr());
@@ -671,7 +671,7 @@ mod imp {
 
         // SAFETY: register arithmetic only.
         let mut total = unsafe { hadd(vaddq_f32(acc0, acc1)) };
-        for &x in chunks.remainder() {
+        for &x in rest {
             total += x * x;
         }
         total
