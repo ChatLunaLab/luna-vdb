@@ -320,7 +320,16 @@ jobs:
         # failed build piped through `tee` would otherwise report success.
         run: |
           set -o pipefail
-          cargo run --release --manifest-path compare/Cargo.toml 2>&1 | tee compare.txt
+          cargo run --release --manifest-path compare/Cargo.toml --bin luna-vdb-legacy-compare 2>&1 | tee compare.txt
+
+      # Recall/latency curves across `nprobe`, on clustered and uniform data.
+      # The uniform set is the worst case for any partitioning index; the
+      # clustered one is closer to real embeddings. Defaults should be chosen
+      # from this table, not from a single speed number.
+      - name: Run recall sweep
+        run: |
+          set -o pipefail
+          cargo run --release --manifest-path compare/Cargo.toml --bin sweep 2>&1 | tee -a compare.txt
 
       - name: Publish to the job summary
         if: always()

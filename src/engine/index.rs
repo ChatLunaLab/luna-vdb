@@ -460,6 +460,23 @@ impl Engine {
         self.nprobe
     }
 
+    /// Change how many cells a query probes, without rebuilding.
+    ///
+    /// `nprobe` is purely a search-time knob — the cells and their contents do
+    /// not depend on it — so retuning recall against latency should not cost a
+    /// rebuild. The value also becomes the configured one, so a later retrain
+    /// keeps it instead of reverting to the default ratio. Clamped to
+    /// `1..=nlist`; ignored while there is no index.
+    pub fn set_nprobe(&mut self, nprobe: usize) {
+        let nlist = self.ivf.nlist();
+        if nlist == 0 {
+            return;
+        }
+        let nprobe = nprobe.clamp(1, nlist);
+        self.nprobe = nprobe;
+        self.options.nprobe = Some(nprobe);
+    }
+
     /// Coarse cell count; `0` when there is no IVF index.
     #[inline]
     pub fn nlist(&self) -> usize {

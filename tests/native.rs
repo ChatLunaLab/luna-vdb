@@ -883,3 +883,32 @@ fn stats_and_memory_reporting() {
         "memory_bytes {bytes} looks too small"
     );
 }
+
+#[test]
+fn set_nprobe_retunes_without_rebuild() {
+    // An engine with no index ignores the call rather than inventing a value.
+    let mut empty = Engine::new(IndexOptions::default());
+    empty.set_nprobe(8);
+    assert_eq!(empty.nprobe(), 0);
+
+    let data = corpus(2_000, 16, 0x5E7);
+    let ids = ids_of(2_000, "v");
+    let mut engine = build(&data, &ids, fast());
+    let nlist = engine.nlist();
+    assert!(nlist > 1, "test corpus should be indexed, got nlist {nlist}");
+
+    // Clamped to `1..=nlist` at both ends.
+    engine.set_nprobe(0);
+    assert_eq!(engine.nprobe(), 1);
+    engine.set_nprobe(usize::MAX);
+    assert_eq!(engine.nprobe(), nlist);
+
+    // Probing every cell must find a stored vector as its own nearest
+    // neighbour — the cells partition the corpus, so nothing is out of reach.
+    for row in [0usize, 7, 999, 1_999] {
+        assert_eq!(engine.search(&data[row], 1).neighbors[0].id, ids[row]);
+    }
+
+    // The value sticks as the configured one.
+    assert_eq!(engine.options().nprobe, Some(nlist));
+}
